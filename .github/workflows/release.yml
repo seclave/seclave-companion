@@ -1,0 +1,141 @@
+# Tag-driven release: push v<version> (matching VERSION in the app) and every
+# artifact is built, checksummed, and attached to a DRAFT GitHub release for
+# the owner to review, sign, and publish. workflow_dispatch runs the same
+# builds without creating a release, for finetuning CI on a branch.
+#
+# No secrets are used anywhere: GPG-signing SHA256SUMS.txt stays a local owner
+# action on the downloaded file before publishing the draft.
+
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install Tk and Xvfb
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q python3-tk xvfb
+      - name: Protocol tests
+        run: python3 dev/test_protocol.py
+      - name: UI smoke test
+        run: xvfb-run -a python3 dev/smoke_ui.py
+
+  version-check:
+    # A tag must name exactly what the tree says it contains.
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Tag matches VERSION
+        # The tag is the only version stamped outside seclave_companion.py -
+        # the packages, version resource, and installer all derive from it.
+        # A -rc.N / -beta suffix on the tag is ignored: rc tags rehearse the
+        # release of the version they point at.
+        run: |
+          app=$(sed -n 's/^VERSION = "\(.*\)"/\1/p' seclave_companion.py)
+          tag="${GITHUB_REF_NAME#v}"; tag="${tag%%-*}"
+          echo "tag=$tag app=$app"
+          [ "$tag" = "$app" ]
+
+  build-linux:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Build deb and rpm
+        run: sh packaging/linux/build_linux_packages.sh
+      - name: Install the deb and run the binary
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q ./dist/seclave-companion_*_all.deb
+          seclave_companion --version
+          test -f /usr/lib/udev/rules.d/60-seclave.rules
+      - uses: actions/upload-artifact@v6
+        with:
+          name: linux-packages
+          path: |
+            dist/*.deb
+            dist/*.rpm
+          if-no-files-found: error
+
+  build-windows:
+    needs: test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+      - name: Build exes, portable zip, and installer
+        run: powershell -ExecutionPolicy Bypass -File packaging\windows\build_windows.ps1
+      - name: Smoke the frozen exe
+        # --version exits before Tk; proves the PE launches on real Windows.
+        run: |
+          $v = (Select-String -Path seclave_companion.py -Pattern '^VERSION = "(.*)"').Matches.Groups[1].Value
+          & ".\dist\SeclaveCompanion-$v-console.exe" --version
+      - uses: actions/upload-artifact@v6
+        with:
+          name: windows-artifacts
+          path: |
+            dist/SeclaveCompanion-*-portable.zip
+            dist/SeclaveCompanion-*.exe
+          if-no-files-found: error
+
+  publish-pypi:
+    # Final tags only - prereleases and rehearsals stay off PyPI. Uses PyPI
+    # trusted publishing (OIDC): no token secret anywhere; PyPI must be
+    # configured once to trust this repo+workflow+environment.
+    if: startsWith(github.ref, 'refs/tags/') && !contains(github.ref_name, '-')
+    needs: [version-check, test]
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/checkout@v6
+      - name: Build sdist and wheel
+        run: pipx run build
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [version-check, build-linux, build-windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write      # create the release
+      id-token: write      # attestation (public repos only)
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        run: |
+          cd dist
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+      - name: Attest build provenance
+        # Attestations need a public repo (or Enterprise); skip while private.
+        if: ${{ !github.event.repository.private }}
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: dist/*
+      - name: Draft release
+        uses: softprops/action-gh-release@v3
+        with:
+          draft: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          files: dist/*
+          body: |
+            Draft - not public until reviewed and published by the owner.
+            Verify downloads against SHA256SUMS.txt; a detached GPG signature
+            is attached at publish time.

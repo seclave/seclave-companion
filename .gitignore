@@ -1,0 +1,8 @@
+__pycache__
+dist/
+dist_*/
+build*/
+*.egg-info/
+# PyInstaller writes a spec beside the repo root for its command-line builds;
+# the one we maintain lives in packaging/windows/.
+/SeclaveCompanion*.spec

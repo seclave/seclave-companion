@@ -1,0 +1,14 @@
+# Seclave 2 in USB-slave mode (CDC-ACM serial, USB ID 20a0:41e3).
+#
+# - ID_MM_DEVICE_IGNORE keeps ModemManager off the port; it otherwise probes
+#   the new ACM device with AT commands and corrupts the first exchange.
+# - TAG+="uaccess" grants the logged-in desktop user access via a logind ACL,
+#   so no group membership is needed on a systemd desktop. GROUP/MODE remain
+#   as the fallback for everything else (classic "dialout" membership).
+# - SYMLINK+="seclave" gives the stable /dev/seclave node the Companion and
+#   seclave_ctl prefer over guessing ttyACM numbers.
+#
+# Numbered 60- so the uaccess tag is set before systemd's seat rules run.
+
+SUBSYSTEM=="usb", ATTRS{idVendor}=="20a0", ATTRS{idProduct}=="41e3", ENV{ID_MM_DEVICE_IGNORE}="1"
+SUBSYSTEM=="tty", ATTRS{idVendor}=="20a0", ATTRS{idProduct}=="41e3", ENV{ID_MM_DEVICE_IGNORE}="1", MODE="0660", GROUP="dialout", TAG+="uaccess", SYMLINK+="seclave"

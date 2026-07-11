@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Seclave Companion
+Comment=Desktop table view for the Seclave hardware password manager
+Exec=seclave_companion
+Icon=seclave-companion
+Terminal=false
+Categories=Utility;Security;
+Keywords=password;seclave;hardware;

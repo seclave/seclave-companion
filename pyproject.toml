@@ -1,0 +1,48 @@
+# Packaging for PyPI: the app is one stdlib-only module, installed as the
+# seclave_companion command. Version is read from VERSION in the module, so a
+# release bump stays a one-line change.
+#
+# There are deliberately no dependencies. tkinter is standard library, but it
+# is built against the Tcl/Tk C libraries and therefore ships with the
+# interpreter or not at all - it cannot be expressed as a PyPI requirement,
+# and packages on PyPI bearing its name are not official. The app checks for
+# it at startup and prints the per-platform install command instead.
+
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "seclave-companion"
+dynamic = ["version"]
+description = "Desktop companion for the Seclave hardware password manager: browse, copy, and edit entries over USB"
+authors = [{name = "seclave", email = "code@seclave.se"}]
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.9"
+keywords = ["seclave", "password-manager", "hardware", "usb", "serial"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: X11 Applications",
+    "Environment :: Win32 (MS Windows)",
+    "Environment :: MacOS X",
+    "Intended Audience :: End Users/Desktop",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Topic :: Security",
+    "Topic :: Utilities",
+]
+
+[project.urls]
+Homepage = "https://www.seclave.se"
+Source = "https://github.com/seclave/seclave-companion"
+
+[project.scripts]
+seclave_companion = "seclave_companion:main"
+
+[tool.setuptools]
+py-modules = ["seclave_companion"]
+
+[tool.setuptools.dynamic]
+version = {attr = "seclave_companion.VERSION"}

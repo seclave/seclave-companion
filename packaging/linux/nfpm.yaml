@@ -1,0 +1,53 @@
+# nfpm config producing the .deb and .rpm packages. Run via
+# packaging/linux/build_linux_packages.sh, which sets VERSION and stages the
+# icon; paths here are relative to the repo root.
+#
+# The app installs as /usr/bin/seclave_companion - the script itself, no
+# bundled interpreter - and depends on the distro's Tk bindings. The package's
+# main job beyond that is the udev rule: ModemManager ignore, a logind ACL for
+# the desktop user (uaccess), and the stable /dev/seclave symlink.
+
+name: seclave-companion
+arch: all
+platform: linux
+version: ${VERSION}
+section: utils
+priority: optional
+maintainer: Seclave AB <code@seclave.se>
+description: |
+  Desktop table view for the Seclave hardware password manager.
+  Talks to the device over its USB-slave (CDC-ACM serial) protocol. Ships a
+  udev rule that keeps ModemManager off the port, grants the desktop user
+  access, and creates a stable /dev/seclave symlink.
+vendor: Seclave AB
+homepage: https://www.seclave.se
+license: MIT
+
+contents:
+  - src: seclave_companion.py
+    dst: /usr/bin/seclave_companion
+    file_info:
+      mode: 0755
+  - src: packaging/linux/60-seclave.rules
+    dst: /usr/lib/udev/rules.d/60-seclave.rules
+  - src: packaging/linux/seclave-companion.desktop
+    dst: /usr/share/applications/seclave-companion.desktop
+  - src: assets/seclave-companion.png
+    dst: /usr/share/icons/hicolor/256x256/apps/seclave-companion.png
+  - src: LICENSE
+    dst: /usr/share/doc/seclave-companion/copyright
+
+scripts:
+  postinstall: packaging/linux/postinstall.sh
+
+overrides:
+  deb:
+    depends:
+      - python3-tk
+  rpm:
+    depends:
+      # Fedora/RHEL name; openSUSE calls it python3-tk - documented, not handled.
+      - python3-tkinter
+
+rpm:
+  summary: Desktop table view for the Seclave hardware password manager
