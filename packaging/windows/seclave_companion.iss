@@ -33,6 +33,9 @@ OutputBaseFilename=SeclaveCompanion-Setup-{#MyAppVersion}
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
+; Shown as the wizard's licence page. The file itself also ships inside the
+; bundle copied below, so an installed copy carries the notice on disk too.
+LicenseFile=..\..\LICENSE
 ; Admin install: puts the app in Program Files.
 PrivilegesRequired=admin
 ArchitecturesInstallIn64BitMode=x64compatible

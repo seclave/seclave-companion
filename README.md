@@ -97,6 +97,8 @@ Running from source you handle serial access yourself: add your user to the
 
 ## Before you start
 
+![Seclave Companion showing the label table](assets/screenshot.png)
+
 Put the device in USB-slave mode: on the Seclave, open the menu and select
 **Usb slave**. The serial port exists only while the device sits in that menu,
 so leaving it (or pressing UP) disconnects the app. Then:

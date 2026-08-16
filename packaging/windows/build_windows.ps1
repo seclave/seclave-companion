@@ -27,12 +27,14 @@ Compress-Archive -Force -Path dist\SeclaveCompanion `
     -DestinationPath "dist\SeclaveCompanion-$version-portable.zip"
 
 # Single-file exe, and the console variant for reading --debug output live.
+# --add-data carries LICENSE the way the spec does for the one-dir bundle: a
+# single exe has no files beside it, so the notice has to be inside it.
 python -m PyInstaller --noconfirm --onefile --windowed --name SeclaveCompanion `
-    --icon assets\seclave.ico --version-file $versionFile `
+    --icon assets\seclave.ico --version-file $versionFile --add-data "LICENSE;." `
     --distpath dist_onefile --workpath build_onefile seclave_companion.py
 Copy-Item dist_onefile\SeclaveCompanion.exe "dist\SeclaveCompanion-$version.exe"
 python -m PyInstaller --noconfirm --onefile --console --name SeclaveCompanion-console `
-    --icon assets\seclave.ico --version-file $versionFile `
+    --icon assets\seclave.ico --version-file $versionFile --add-data "LICENSE;." `
     --distpath dist_console --workpath build_console seclave_companion.py
 Copy-Item dist_console\SeclaveCompanion-console.exe "dist\SeclaveCompanion-$version-console.exe"
 

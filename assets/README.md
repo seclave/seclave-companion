@@ -5,6 +5,8 @@ staging):
   Linux packages.
 - `seclave.ico` - 48px + 256px, embedded in the Windows executable by the
   PyInstaller spec.
+- `screenshot.png` - the label table, shown in the README. Captured headlessly
+  against the development stub device, so every entry in it is invented.
 
 The Seclave logo is a trademark of Seclave AB. The MIT license of this
 repository grants no trademark rights; do not reuse these icons for anything

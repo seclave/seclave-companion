@@ -2925,7 +2925,11 @@ if HAVE_TK:
             messagebox.showinfo(
                 "About Seclave Companion",
                 "Seclave Companion %s\n"
-                "Copyright (c) 2026 Seclave AB"
+                "Copyright (c) 2026 Seclave AB\n\n"
+                "MIT licensed, and provided without warranty of any kind. The "
+                "full licence text ships with the program, in the LICENSE "
+                "file.\n\n"
+                "Seclave is a trademark of Seclave AB."
                 % (VERSION))
 
         def _on_close(self):

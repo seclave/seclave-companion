@@ -74,16 +74,18 @@ fi
     shutil.make_archive('SeclaveCompanion-$VERSION-portable', 'zip', '.', 'SeclaveCompanion')")
 
 # Single-file build: same icon and version resource, self-extracting at launch.
+# --add-data puts LICENSE inside the exe, as the spec does for the one-dir
+# bundle; the separator is ';' because this is Windows Python under Wine.
 $RUN wine "$WINEPY" -m PyInstaller --noconfirm --onefile --windowed \
     --name SeclaveCompanion --icon assets/seclave.ico \
-    --version-file "$VERSION_FILE" \
+    --version-file "$VERSION_FILE" --add-data 'LICENSE;.' \
     --distpath dist_onefile --workpath build_onefile seclave_companion.py
 cp dist_onefile/SeclaveCompanion.exe "dist/SeclaveCompanion-$VERSION.exe"
 
 # Console variant for reading --debug output live.
 $RUN wine "$WINEPY" -m PyInstaller --noconfirm --onefile --console \
     --name SeclaveCompanion-console --icon assets/seclave.ico \
-    --version-file "$VERSION_FILE" \
+    --version-file "$VERSION_FILE" --add-data 'LICENSE;.' \
     --distpath dist_console --workpath build_console seclave_companion.py
 cp dist_console/SeclaveCompanion-console.exe "dist/SeclaveCompanion-$VERSION-console.exe"
 

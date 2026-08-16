@@ -29,7 +29,10 @@ a = Analysis(
     ['../../seclave_companion.py'],
     pathex=[],
     binaries=[],
-    datas=[],
+    # MIT wants the notice to travel with every copy. The Linux packages carry
+    # it as their distribution copyright file; on Windows it rides in the
+    # bundle, which is also what the installer lays down.
+    datas=[('../../LICENSE', '.')],
     hiddenimports=[],
     hookspath=[],
     runtime_hooks=[],
