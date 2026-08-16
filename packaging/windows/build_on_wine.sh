@@ -13,7 +13,7 @@
 #   SeclaveCompanion-<version>-portable.zip zipped one-dir bundle
 #   SeclaveCompanion-<version>.exe          single self-contained exe
 #   SeclaveCompanion-Setup-<version>.exe    installer (WITH_INSTALLER=0 skips)
-#   SHA256SUMS.txt                          checksums; GPG-sign for release
+#   SHA256SUMS.txt                          checksums
 #
 # A Wine-built exe MUST still pass a real-Windows test before release; this
 # script saves a build machine, not the verification.
@@ -102,5 +102,4 @@ fi
     "SeclaveCompanion-$VERSION.exe" "SeclaveCompanion-$VERSION-console.exe" \
     "SeclaveCompanion-Setup-$VERSION.exe" > SHA256SUMS.txt)
 
-echo "Done. Release steps: gpg --detach-sign --armor dist/SHA256SUMS.txt,"
-echo "then test the artifacts on real Windows before publishing."
+echo "Done. Test the artifacts on real Windows before publishing."

@@ -10,6 +10,8 @@ pseudo-terminal - the same path used against hardware, minus the joystick.
 
 import os
 import sys
+import time
+import queue
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -84,6 +86,22 @@ class EnumerationTests(unittest.TestCase):
         self.assertEqual(rows[0], ("github.com", "alice"))
         self.assertEqual(rows[1], ("github.com", "bob"))
         self.assertEqual(rows[2][0], "news.example.co.uk")
+
+    def test_list_label_groups_matches_the_label_walk(self):
+        pairs = self.session.list_label_groups()
+        self.assertEqual([p[0] for p in pairs], self.session.list_labels())
+        groups = dict(pairs)
+        self.assertEqual(groups["gmail"], "personal")
+        # wwwfill entries surface under their reserved group.
+        web_label = next(l for l in groups if l.startswith("github.com"))
+        self.assertEqual(groups[web_label], "wwwfill")
+
+    def test_per_label_groups_match_op14(self):
+        # The pre-2.7 fallback reads groups one at a time with GET_GROUP; the
+        # mapping it builds must match what op 14 returns in one enumeration.
+        labels = self.session.list_labels()
+        by_label = {label: self.session.get_group(label) for label in labels}
+        self.assertEqual(by_label, dict(self.session.list_label_groups()))
 
     def test_enumerations_are_independent(self):
         # Listing labels must not touch the wwwfill enumeration, and vice versa -
@@ -340,6 +358,62 @@ class WwwfillDedupTests(unittest.TestCase):
                 self.PAIRS, "github.com", "alice"))
         finally:
             sc.ENFORCE_WWWFILL_DEDUP = previous
+
+
+class GroupFallbackWorkerTests(unittest.TestCase):
+    """The pre-2.7 group load lives in the Worker: enumerate labels, read each
+    group, and report whether the device began prompting per entry."""
+
+    def _drive(self, session, transport):
+        out = queue.Queue()
+        worker = sc.Worker(out)
+        worker.transport = transport
+        worker.session = session
+        worker.start()
+        try:
+            worker.submit("load_labels_groups")
+            return out.get(timeout=5)
+        finally:
+            worker.submit("quit")
+            worker.join(timeout=5)
+
+    def test_promptless_fills_every_group(self):
+        device = stub_device.FakeDevice()
+        session, transport = connect(device)
+        event = self._drive(session, transport)
+        self.assertEqual(event.name, "loaded_labels")
+        self.assertFalse(event.data["groups_prompting"])
+        groups = event.data["groups"]
+        self.assertEqual(set(groups), set(event.data["labels"]))
+        self.assertEqual(groups["gmail"], "personal")
+        # A pre-2.7 load never sends op 14; the groups come from GET_GROUP.
+        self.assertEqual(device.op_counts.get(sc.OP_GET_LABELGROUPIDX, 0), 0)
+        self.assertGreater(device.op_counts.get(sc.OP_GET_GROUP, 0), 0)
+
+    def test_slow_group_read_is_sensed_as_prompting(self):
+        device = stub_device.FakeDevice()
+        session, transport = connect(device)
+        expected_labels = session.list_labels()
+        # A group read past the sense threshold means the device is asking the
+        # user to confirm each one: the load stops at the first and flags it,
+        # instead of walking every entry behind a prompt.
+        original = session.get_group
+        saved = sc.GROUP_PROMPT_SENSE_SECONDS
+        sc.GROUP_PROMPT_SENSE_SECONDS = 0.05
+
+        def slow(label):
+            time.sleep(0.1)
+            return original(label)
+
+        session.get_group = slow
+        try:
+            event = self._drive(session, transport)
+        finally:
+            sc.GROUP_PROMPT_SENSE_SECONDS = saved
+        self.assertTrue(event.data["groups_prompting"])
+        self.assertLessEqual(len(event.data["groups"]), 1)
+        # The labels still all loaded - only the group walk was cut short.
+        self.assertEqual(event.data["labels"], expected_labels)
 
 
 if __name__ == "__main__":

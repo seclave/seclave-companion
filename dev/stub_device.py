@@ -28,9 +28,12 @@ import seclave_companion as sc
 
 
 class FakeDevice:
-    def __init__(self, delay=0.0, always_abort=False):
+    def __init__(self, delay=0.0, always_abort=False, fw_version="2.7"):
         self.delay = delay
         self.always_abort = always_abort
+        # Firmware the stub pretends to be: version oracle answered when
+        # set, "entry not found" (a pre-2.7 device) when None.
+        self.fw_version = fw_version
         # Regular entries: label -> dict(group, username, password, optional).
         self.entries = {}
         # Web logins: list of dict(domain, username, password).
@@ -98,6 +101,20 @@ class FakeDevice:
                 return bytes([sc.ST_OUT_OF_INDEX])
             return bytes([sc.ST_OK]) + sc.encode_field(sc.latin1(labels[index]))
 
+        if opcode == sc.OP_GET_LABELGROUPIDX:
+            # Same walk as GET_LABELIDX with the group riding along;
+            # wwwfill entries surface under their reserved group.
+            self._confirm_pause()
+            index, _ = sc.decode_int(body, 0)
+            rows = [(label, self.entries[label]["group"])
+                    for label in sorted(self.entries)]
+            rows += [(self._web_label(w), "wwwfill") for w in self.web]
+            if index >= len(rows):
+                return bytes([sc.ST_OUT_OF_INDEX])
+            label, group = rows[index]
+            return (bytes([sc.ST_OK]) + sc.encode_field(sc.latin1(label))
+                    + sc.encode_field(sc.latin1(group)))
+
         if opcode == sc.OP_GET_WWWFILLIDX:
             self._confirm_pause()
             index, _ = sc.decode_int(body, 0)
@@ -126,6 +143,13 @@ class FakeDevice:
             (start, end), off = sc.decode_field_span(body, 0)
             domain = body[start:end].decode("latin-1")
             index, _ = sc.decode_int(body, off)
+            if domain == sc.VERSION_DOMAIN:
+                # The capability bit only: the marker and an empty field.
+                if self.fw_version is None or index != 0:
+                    return bytes([sc.ST_ENTRY_NOT_FOUND])
+                return (bytes([sc.ST_OK])
+                        + sc.encode_field(sc.latin1(sc.VERSION_MARKER))
+                        + sc.encode_field(b""))
             matches = [w for w in self.web if w["domain"] == domain]
             if index >= len(matches):
                 return bytes([sc.ST_ENTRY_NOT_FOUND])
@@ -133,6 +157,14 @@ class FakeDevice:
             status = sc.ST_MORE_LABELS if index + 1 < len(matches) else sc.ST_OK
             return (bytes([status]) + sc.encode_field(sc.latin1(entry["username"]))
                     + sc.encode_field(sc.latin1(entry["password"])))
+
+        if opcode == sc.OP_QUERY_STATUS:
+            # No arguments, no prompt: version, used entries, capacity.
+            used = len(self.entries) + len(self.web)
+            return (bytes([sc.ST_OK])
+                    + sc.encode_field(sc.latin1(self.fw_version))
+                    + sc.encode_field(sc.latin1(str(used)))
+                    + sc.encode_field(sc.latin1("500")))
 
         if opcode == sc.OP_PUT_ENTRY:
             self._confirm_pause()

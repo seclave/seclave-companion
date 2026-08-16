@@ -42,7 +42,7 @@ import threading
 # The only place a release version is written by hand. Everything else derives
 # from it: the PyPI metadata, the deb/rpm, the Windows version resource, the
 # installer, and the artifact names. See "Releasing" in README.md.
-VERSION = "1.1.2"
+VERSION = "1.2.0"
 
 # ---------------------------------------------------------------------------
 # Optional tracing (--debug). Port discovery and the serial open are the two
@@ -102,6 +102,8 @@ OP_PUT_ENTRY = 9
 OP_DEL_ENTRY = 10
 OP_DEL_WWWFILL = 11
 OP_GET_BACKUP = 12
+OP_QUERY_STATUS = 13        # 2.7+ only - probe with VERSION_DOMAIN first
+OP_GET_LABELGROUPIDX = 14   # 2.7+ only - the label enumeration with the group
 
 # Response status codes.
 ST_OK = 0
@@ -122,6 +124,16 @@ STATUS_MESSAGE = {
     ST_BAD_LABEL: "The label or group has invalid characters or length.",
     ST_BAD_DOMAIN: "The domain has invalid characters or length.",
 }
+
+# The entry fields the table can show besides the label, in column order. The
+# password is deliberately not among them: it is fetched to the clipboard or a
+# viewer and never held in a row.
+TABLE_FIELDS = ("group", "username", "optional")
+
+# The tabled fields treated as sensitive: Hide fields masks them and a detach
+# forgets them. Label and group stay through both - they are what keeps a row
+# findable.
+SENSITIVE_FIELDS = ("username", "optional")
 
 # Field maxima (bytes on the wire, Latin-1).
 MAX_LABEL = 16
@@ -146,6 +158,20 @@ RECV_POLL_MS = 250
 
 WWWFILL_GROUP = "wwwfill"
 
+# Firmware discovery is two-stage. The probe: reading this reserved
+# web-password domain (index 0) is promptless and harmless on every
+# firmware - 2.7 and later intercept it and answer the marker below
+# (plus one empty field), while 2.6 and earlier know no such domain and
+# answer "entry not found". That single bit says whether the canonical
+# QUERY_STATUS command exists; probing with an unknown command instead
+# is NOT safe (firmware treats it as a parse error and leaves slave
+# mode). The \xf6 prefix is o-umlaut in Latin-1 ("oooseclave..." with
+# three umlauts): charset-legal for a domain, case-folded by the
+# device, and practically collision-proof against real entries. The
+# device refuses to store the domain, so nothing can shadow it.
+VERSION_DOMAIN = "\xf6\xf6\xf6seclave.version"
+VERSION_MARKER = "\xf6\xf6\xf6seclave"
+
 # Charset the device accepts for label / group / domain (case-insensitive).
 LABEL_CHARSET = set(string.ascii_letters + string.digits + "._-" +
                     "æÆåÅäÄöÖøØüÜß")
@@ -165,6 +191,24 @@ LABEL_CHARSET = set(string.ascii_letters + string.digits + "._-" +
 ENFORCE_WWWFILL_DEDUP = True
 
 CLIPBOARD_CLEAR_MS = 30_000  # auto-clear a copied secret after 30 s
+
+# Shown in the table where a field has not been revealed yet. It stands for a
+# value the device holds but has not been asked for, which an empty cell would
+# not distinguish from a field that is genuinely empty.
+UNKNOWN_FIELD = "•••"
+
+# Shown in place of revealed fields the user covered with the Hide fields
+# button. The values stay in the row - hiding guards against onlookers, it
+# forgets nothing - so copying or re-showing them costs no new device read.
+HIDDEN_FIELD = "(hidden)"
+
+# Reading groups one by one (pre-2.7, no GET_LABELGROUPIDX) is promptless only
+# in "Allow all" access mode; in Normal and Ask all the device raises a
+# confirmation per entry, which a human answers no faster than this. A single
+# group read that takes longer is taken as proof the device is prompting, and
+# the bulk load stops and points the user at the access-mode setting instead of
+# marching through a confirmation per entry.
+GROUP_PROMPT_SENSE_SECONDS = 1.0
 
 # Preferred initial window size in pixels (width, height). The window opens at
 # this size, or larger if the widgets need more room; the user can resize it.
@@ -309,7 +353,7 @@ def latin1(text):
 # response at a time straight into it (never into an intermediate `bytes`). The
 # shared interface is:
 #   open(), write(bytes), begin_recv(), recv() -> memoryview, wipe(), wake(),
-#   close().
+#   probe(), close().
 # recv() blocks until at least one byte arrives (the device sends nothing while
 # awaiting confirmation) and returns a memoryview of everything received so far;
 # the session re-parses that view until the response is complete. wake()
@@ -438,6 +482,19 @@ class PosixSerial:
 
     def wipe(self):
         self.arena.wipe()
+
+    def probe(self):
+        """Raise Disconnected if the port is gone. An unplug while no command
+        is in flight fails no I/O on its own, so the worker probes between
+        commands; nothing may go out on the wire here - any real frame could
+        prompt for a confirmation on the device."""
+        import termios
+        try:
+            termios.tcgetattr(self.fd)   # returns EIO/ENXIO once the tty died
+        except termios.error:
+            raise Disconnected
+        if not os.path.exists(self.path):
+            raise Disconnected
 
     def wake(self):
         os.write(self._wake_w, b"x")
@@ -620,6 +677,18 @@ class WindowsSerial:
 
     def wipe(self):
         self.arena.wipe()
+
+    def probe(self):
+        # See PosixSerial.probe. ClearCommError is the same liveness check the
+        # blocked-read loop uses: it fails once the port object is gone.
+        import ctypes
+        from ctypes import wintypes
+        errors = wintypes.DWORD(0)
+        if not self._k32.ClearCommError(self.handle, ctypes.byref(errors),
+                                        None):
+            debug("port gone (probe: ClearCommError error %d)",
+                  ctypes.get_last_error())
+            raise Disconnected
 
     def wake(self):
         # The recv loop notices the flag between polls; CancelIoEx cuts short a
@@ -897,6 +966,24 @@ class DeviceSession:
                 status, spans = parsed
                 return status, spans, view
 
+    def query_status(self):
+        """The device's firmware version, used entries and total capacity,
+        as three strs. Promptless in every access mode - none of it is a
+        secret. Only safe on firmware that answered the version probe:
+        older firmware treats an unknown command as a parse error and
+        leaves slave mode."""
+        payload = bytes([OP_QUERY_STATUS])
+        try:
+            status, spans, view = self._exchange(payload, 3)
+            if status == ST_ABORT:
+                raise Cancelled
+            if status != ST_OK:
+                raise DeviceError(status)
+            return tuple(bytes(view[start:end]).decode("latin-1")
+                         for start, end in spans)
+        finally:
+            self.transport.wipe()
+
     # --- enumerations: confirm once on the device, then stream ---
 
     def list_labels(self):
@@ -914,6 +1001,30 @@ class DeviceSession:
                     raise DeviceError(status)
                 (start, end), = spans
                 labels.append(bytes(view[start:end]).decode("latin-1"))
+            finally:
+                self.transport.wipe()
+            index += 1
+
+    def list_label_groups(self):
+        """(label, group) per entry - the same enumeration and the same
+        single confirmation as list_labels, with the group riding along.
+        Firmware 2.7+ only: older firmware treats the opcode as a parse
+        error and drops out of slave mode, so gate on the version probe."""
+        pairs = []
+        index = 0
+        while True:
+            payload = bytes([OP_GET_LABELGROUPIDX]) + encode_int(index)
+            try:
+                status, spans, view = self._exchange(payload, 2)
+                if status == ST_OUT_OF_INDEX:
+                    return pairs
+                if status == ST_ABORT:
+                    raise Cancelled
+                if status != ST_OK:
+                    raise DeviceError(status)
+                (ls, le), (gs, ge) = spans
+                pairs.append((bytes(view[ls:le]).decode("latin-1"),
+                              bytes(view[gs:ge]).decode("latin-1")))
             finally:
                 self.transport.wipe()
             index += 1
@@ -1021,9 +1132,15 @@ class DeviceSession:
     def put_wwwfill(self, domain, username, password):
         # Defense in depth: never send a domain outside the charset the device
         # accepts (an embedded NUL is the dangerous case). The dialog validates
-        # this already; this guards non-GUI callers such as future bulk-import
-        # tooling.
+        # this already; this guards any caller that bypasses it.
         if validate_restricted(domain, MAX_OPTIONAL, False):
+            raise DeviceError(ST_BAD_DOMAIN)
+        # Firmware 2.7 and later refuses this domain itself; earlier firmware
+        # would store it, and a stored entry can shadow the version probe. A
+        # crafted one even answers the probe like 2.7+ firmware would, and the
+        # QUERY_STATUS that follows is an unknown command to the firmware that
+        # let it be stored - a parse error, which drops it out of slave mode.
+        if latin1_fold(domain) == latin1_fold(VERSION_DOMAIN):
             raise DeviceError(ST_BAD_DOMAIN)
         payload = bytes([OP_PUT_WWWFILL]) + encode_field(latin1(domain)) + \
             encode_field(latin1(username)) + encode_field(latin1(password))
@@ -1108,6 +1225,110 @@ class Worker(threading.Thread):
         self.transport = None
         self.session = None
 
+    @staticmethod
+    def _failure_reason(err):
+        return ("was declined on the device" if isinstance(err, Cancelled)
+                else "failed: %s" % err)
+
+    @staticmethod
+    def _entry_summary(data):
+        """The tabled fields of an entry we just wrote, for the saved event."""
+        return {name: data[name] for name in ("label",) + TABLE_FIELDS}
+
+    def _edit_entry(self, data):
+        """An edit never deletes first: whatever fails, the device holds the
+        credential - old, new, or briefly both - at every step."""
+        fields = {k: data[k] for k in
+                  ("label", "group", "username", "password", "optional")}
+        summary = self._entry_summary(data)
+        if latin1_fold(data["old_label"]) != latin1_fold(fields["label"]):
+            # A rename: the new label is free, so this is a plain add with
+            # a definite answer. The old entry goes only once the new one
+            # is on the device; a failed delete leaves a leftover to clean
+            # up, never a lost credential.
+            self.session.put_entry(**fields)
+            try:
+                self.session.del_entry(data["old_label"])
+            except (Cancelled, DeviceError) as err:
+                self.emit("saved", view="labels", action="edit",
+                          old_label=data["old_label"],
+                          old_remains=self._failure_reason(err), **summary)
+            else:
+                self.emit("saved", view="labels", action="edit",
+                          old_label=data["old_label"], **summary)
+            return
+        # The label is unchanged, so the put lands on the entry itself and
+        # the device asks the user whether to replace it. Firmware 2.7 and
+        # later answers with the outcome: OK for replaced, a decline
+        # otherwise. 2.6 and earlier answers "exists" while its replace
+        # prompt is still open, and never reports the choice.
+        try:
+            self.session.put_entry(**fields)
+        except DeviceError as err:
+            if err.status != ST_LABEL_EXISTS:
+                raise
+        else:
+            self.emit("saved", view="labels", action="edit",
+                      old_label=data["old_label"], **summary)
+            return
+        if not data["changed"]:
+            # Old and new records are identical; the prompt's outcome
+            # cannot matter.
+            self.emit("saved", view="labels", action="edit",
+                      old_label=data["old_label"], **summary)
+            return
+        # Old firmware, outcome unknown. Fields the edit kept are the same
+        # in both records and stay known; only the changed ones are not.
+        # A changed group settles even those with one read: the get queues
+        # behind the open prompt and returns the surviving record's group.
+        if "group" in data["changed"]:
+            try:
+                group_now = self.session.get_group(fields["label"])
+            except (Cancelled, DeviceError):
+                group_now = None
+            if group_now == fields["group"]:
+                self.emit("saved", view="labels", action="edit",
+                          old_label=data["old_label"], **summary)
+                return
+            if group_now == data["old_group"]:
+                self.emit("declined", request="edit_entry")
+                return
+        self.emit("save_pending", view="labels", label=fields["label"],
+                  changed=data["changed"])
+
+    def _edit_wwwfill(self, data):
+        if wwwfill_key(data["old_domain"], data["old_username"]) != \
+                wwwfill_key(data["domain"], data["username"]):
+            # A new identity - free per the duplicate check, so a plain
+            # add; the old pair goes only after it succeeded.
+            self.session.put_wwwfill(data["domain"], data["username"],
+                                     data["password"])
+            try:
+                self.session.del_wwwfill(data["old_domain"],
+                                         data["old_username"])
+            except (Cancelled, DeviceError) as err:
+                self.emit("saved", view="web",
+                          old_remains=self._failure_reason(err),
+                          old_pair="%s / %s" % (data["old_domain"],
+                                                data["old_username"]))
+            else:
+                self.emit("saved", view="web")
+            return
+        # Same identity. In the default access mode the device replaces in
+        # place and answers OK; in Ask all, firmware 2.6 and earlier
+        # answers "exists" with its replace prompt still open. The stored
+        # password is then old or new - nothing is cached, so the next
+        # read simply shows the one that survived.
+        try:
+            self.session.put_wwwfill(data["domain"], data["username"],
+                                     data["password"])
+        except DeviceError as err:
+            if err.status != ST_LABEL_EXISTS:
+                raise
+            self.emit("save_pending", view="web")
+        else:
+            self.emit("saved", view="web")
+
     def _dispatch(self, req):
         name = req.name
         if name == "open":
@@ -1120,8 +1341,72 @@ class Worker(threading.Thread):
             self._drop()
             self.emit("disconnected")
 
+        elif name == "ping":
+            # Idle liveness check from the UI's port poll. The probe raises
+            # Disconnected when the port is gone, which run() turns into the
+            # disconnected event; a live port answers with no event at all.
+            if self.transport is not None:
+                self.transport.probe()
+
+        elif name == "query_version":
+            # Two stages (see VERSION_DOMAIN): the probe tells old and new
+            # firmware apart with one promptless read that is safe
+            # everywhere; only when the marker confirms 2.7+ does the
+            # canonical QUERY_STATUS run for the version and store usage.
+            # `definite` is False when the user declined the probe (Ask
+            # all mode) - that proves nothing about the firmware.
+            version = used = total = None
+            definite = True
+            try:
+                user, pw, _ = self.session.get_wwwfill(VERSION_DOMAIN, 0)
+            except Cancelled:
+                definite = False
+            except DeviceError as err:
+                if err.status != ST_ENTRY_NOT_FOUND:
+                    raise
+            else:
+                marker = user.text()
+                user.clear()
+                pw.clear()
+                if marker.startswith(VERSION_MARKER):
+                    version, used_text, total_text = \
+                        self.session.query_status()
+                    if used_text.isdigit() and total_text.isdigit():
+                        used, total = int(used_text), int(total_text)
+            self.emit("fw_info", version=version, used=used, total=total,
+                      definite=definite)
+
         elif name == "load_labels":
-            self.emit("loaded_labels", labels=self.session.list_labels())
+            if req.data.get("with_groups"):
+                pairs = self.session.list_label_groups()
+                self.emit("loaded_labels", labels=[p[0] for p in pairs],
+                          groups=dict(pairs))
+            else:
+                self.emit("loaded_labels", labels=self.session.list_labels())
+
+        elif name == "load_labels_groups":
+            # Pre-2.7 fallback for the group column: enumerate labels (one
+            # confirmation), then read each group with GET_GROUP. That is quick
+            # only in "Allow all" access mode; otherwise every read prompts on
+            # the device. Time each one - a read past the sense threshold, or a
+            # decline, means the device is prompting, so stop and let the UI
+            # advise the mode change rather than storm the user with prompts.
+            # The labels and the groups gathered so far are kept either way.
+            labels = self.session.list_labels()
+            groups = {}
+            prompting = False
+            for label in labels:
+                started = time.monotonic()
+                try:
+                    groups[label] = self.session.get_group(label)
+                except Cancelled:
+                    prompting = True
+                    break
+                if time.monotonic() - started > GROUP_PROMPT_SENSE_SECONDS:
+                    prompting = True
+                    break
+            self.emit("loaded_labels", labels=labels, groups=groups,
+                      groups_prompting=prompting)
 
         elif name == "load_web":
             self.emit("loaded_web", web=self.session.list_wwwfill())
@@ -1170,6 +1455,11 @@ class Worker(threading.Thread):
                       username=username, password=password, optional=optional,
                       purpose=req.data["purpose"])
 
+        elif name == "load_single":
+            label = req.data["label"]
+            group = self.session.get_group(label)
+            self.emit("loaded_label_and_group", label=label, group=group)
+
         elif name == "fetch_wwwfill":
             # The table already shows the domain and username; only the
             # password needs fetching.
@@ -1181,35 +1471,27 @@ class Worker(threading.Thread):
                       purpose=req.data["purpose"])
 
         elif name == "put_entry":
+            # The saved events below carry what changed: the UI mirrors it
+            # into the table instead of re-enumerating (see LabelRows). The
+            # password is deliberately not among them - it is never tabled.
             self.session.put_entry(**req.data)
-            self.emit("saved", view="labels")
+            self.emit("saved", view="labels", action="add",
+                      **self._entry_summary(req.data))
 
         elif name == "put_wwwfill":
             self.session.put_wwwfill(**req.data)
             self.emit("saved", view="web")
 
         elif name == "edit_entry":
-            # Editing is delete-then-add rather than a plain put onto an existing
-            # label. A put onto an existing label triggers the device's own
-            # "replace?" prompt, and if the user declines it the device sends no
-            # reply at all - the host read would block forever. Deleting first
-            # avoids that path and gives a definite status for every command.
-            self.session.del_entry(req.data["old_label"])
-            fields = {k: req.data[k] for k in
-                      ("label", "group", "username", "password", "optional")}
-            self.session.put_entry(**fields)
-            self.emit("saved", view="labels")
+            self._edit_entry(req.data)
 
         elif name == "edit_wwwfill":
-            self.session.del_wwwfill(req.data["old_domain"],
-                                     req.data["old_username"])
-            self.session.put_wwwfill(req.data["domain"], req.data["username"],
-                                     req.data["password"])
-            self.emit("saved", view="web")
+            self._edit_wwwfill(req.data)
 
         elif name == "del_entry":
             self.session.del_entry(req.data["label"])
-            self.emit("saved", view="labels")
+            self.emit("saved", view="labels", action="delete",
+                      label=req.data["label"])
 
         elif name == "del_wwwfill":
             self.session.del_wwwfill(req.data["domain"], req.data["username"])
@@ -1225,6 +1507,129 @@ GEN_ALPHABET = string.ascii_letters + string.digits + "!@#$%^&*-_=+"
 
 def generate_password(length):
     return "".join(secrets.choice(GEN_ALPHABET) for _ in range(length))
+
+
+# ---------------------------------------------------------------------------
+# The label table's rows. Model only - no Tk - so it can be tested without a
+# display.
+# ---------------------------------------------------------------------------
+
+class LabelRows:
+    """A best-effort mirror of the entries stored on the device.
+
+    Only a full enumeration knows which labels exist, and it costs a device
+    confirmation the user may not want to give. Every other operation
+    therefore updates the mirror in place instead of re-reading: loading a
+    single entry, adding, editing and deleting each leave it agreeing with
+    the device without asking it anything, so the table stays usable for a
+    user who declines to enumerate again.
+
+    Fields are held only once revealed - each one cost its own confirmation
+    on the device - and a later enumeration keeps them: it replaces the set
+    of labels, never the values already read out of them.
+
+    A row can be marked hidden: the table then masks its revealed sensitive
+    fields (username and optional - group stays shown), but the values stay
+    in the row, so re-showing or copying them costs no new confirmation. The
+    flag is display state only, and it survives an enumeration the same way
+    the values do.
+
+    Rows are kept in the device's own order, which is labels sorted under
+    the case fold the device compares them with (see latin1_fold). Two
+    labels differing only under that fold are one row here because they are
+    one entry there.
+    """
+
+    def __init__(self):
+        self._rows = {}        # fold key -> row
+        # Whether the rows are known to be every entry on the device. A full
+        # enumeration sets it; anything that can go stale behind our back
+        # (a new session, a load about to be attempted) clears it.
+        self.complete = False
+
+    def __len__(self):
+        return len(self._rows)
+
+    @staticmethod
+    def _blank(label):
+        row = dict.fromkeys(TABLE_FIELDS)
+        row["label"] = label
+        row["hidden"] = False
+        return row
+
+    def rows(self):
+        """Every row, in the device's label order."""
+        return [self._rows[key] for key in sorted(self._rows)]
+
+    def get(self, label):
+        return self._rows.get(latin1_fold(label))
+
+    def replace_all(self, labels):
+        """Adopt a full enumeration. The device's list decides which labels
+        exist; fields already revealed for the survivors are carried over."""
+        rows = {}
+        for label in labels:
+            key = latin1_fold(label)
+            row = self._rows.get(key) or self._blank(label)
+            row["label"] = label      # the device's spelling wins
+            rows[key] = row
+        self._rows = rows
+        self.complete = True
+
+    def reveal(self, label, **fields):
+        """Record fields now known for `label`, adding the row if it is not
+        here yet. Known means read from the device under the user's
+        confirmation, or just written there by us."""
+        key = latin1_fold(label)
+        row = self._rows.get(key)
+        if row is None:
+            row = self._blank(label)
+            self._rows[key] = row
+        for name, value in fields.items():
+            if name not in TABLE_FIELDS:
+                raise KeyError(f"not a label field: {name}")
+            row[name] = value
+        return row
+
+    def forget(self, *fields):
+        """Return the named fields to the not-read state in every row. Unlike
+        hiding, this really forgets: the next look at one of these values
+        costs a device confirmation again."""
+        for name in fields:
+            if name not in TABLE_FIELDS:
+                raise KeyError(f"not a label field: {name}")
+        for row in self._rows.values():
+            for name in fields:
+                row[name] = None
+
+    def unread(self, label, *fields):
+        """Return the named fields of one row to the not-read state - the
+        row-level counterpart of forget, for when just this entry's values
+        are no longer known to match the device."""
+        row = self._rows.get(latin1_fold(label))
+        if row is None:
+            return
+        for name in fields:
+            if name not in TABLE_FIELDS:
+                raise KeyError(f"not a label field: {name}")
+            row[name] = None
+
+    def toggle_hidden(self, label):
+        """Flip whether the row's revealed fields are displayed or masked.
+        The values stay in the row either way: hiding is for onlookers, it
+        does not forget anything. Returns the new state."""
+        row = self._rows[latin1_fold(label)]
+        row["hidden"] = not row["hidden"]
+        return row["hidden"]
+
+    def remove(self, label):
+        self._rows.pop(latin1_fold(label), None)
+
+    def replace(self, old_label, label, **fields):
+        """An edit: the old label's row makes way for the new one, which
+        also covers a rename changing only the spelling."""
+        self.remove(old_label)
+        return self.reveal(label, **fields)
 
 
 # ---------------------------------------------------------------------------
@@ -1279,6 +1684,12 @@ if HAVE_TK:
                   foreground=[("selected", STYLE["white"])])
         style.configure("Status.TLabel", background=STYLE["bg"],
                         foreground=STYLE["muted"])
+        # The X11 message box wraps its text at 3 inches, which stacks anything
+        # longer than a sentence into a tall narrow column. The option database
+        # is the only way in; this entry outranks Tk's own because option_add
+        # sets it at interactive priority. Windows and macOS use the native
+        # dialog and ignore it.
+        root.option_add("*Dialog.msg.wrapLength", "6i")
         return style
 
     def draw_key_mark(canvas):
@@ -1290,6 +1701,12 @@ if HAVE_TK:
         canvas.create_line(28, 18, 52, 18, fill=STYLE["muted"], width=3)
         canvas.create_line(44, 18, 44, 25, fill=STYLE["muted"], width=3)
         canvas.create_line(50, 18, 50, 24, fill=STYLE["muted"], width=3)
+
+    def _toolbar_rule(parent):
+        """A thin vertical rule that sets one cluster of toolbar buttons off
+        from the next."""
+        ttk.Separator(parent, orient="vertical").pack(
+            side="left", fill="y", padx=8, pady=2)
 
     class EntryDialog(tk.Toplevel):
         """Add or edit an entry. `existing` is None for Add, or a dict for Edit."""
@@ -1312,8 +1729,8 @@ if HAVE_TK:
             if existing:
                 self._load_existing(existing)
                 self.error.configure(
-                    text="Saving replaces the entry: delete then add, each "
-                         "step confirmed on the device.",
+                    text="Saving asks the device to replace this entry - "
+                         "confirm it there.",
                     foreground=STYLE["muted"])
             self._refresh_fields()
             self.grab_set()
@@ -1429,22 +1846,37 @@ if HAVE_TK:
                     data[key] = self.vars[key].get()
             problem = next((e for e in errors if e), None)
             if problem is None:
-                # The app-level save can refuse too (the wwwfill duplicate
-                # check): it returns a message to show, or None once the
-                # request is on its way to the device.
-                problem = self.on_save(data, self.existing)
+                # The app-level save can refuse too (the duplicate and
+                # collision checks): it returns a message to show, or None
+                # once the request is on its way to the device.
+                problem = self.on_save(data, self.existing, self)
             if problem:
                 self.error.configure(text=problem, foreground=STYLE["blue_hover"])
                 return
-            self.destroy()
+            # Stay open until the device answers. An edit deletes the old
+            # entry before adding the new one, so if the add is declined or
+            # fails, what was typed here - the password above all - is the
+            # only copy left; App closes the dialog on the saved event and
+            # re-arms it on any failure.
+            self.save_btn.configure(state="disabled")
+            self.error.configure(text="Waiting for the device...",
+                                 foreground=STYLE["muted"])
+
+        def save_failed(self, message):
+            """Re-arm Save after a failed attempt; the fields keep their
+            values, so trying again is one click, not a retype."""
+            self.save_btn.configure(state="normal")
+            self.error.configure(text=message, foreground=STYLE["red"])
 
     class EntryViewer(tk.Toplevel):
         """Read-only view of every field of one entry. The values are
         selectable; the password stays masked until "show" is ticked. Nothing
         here is cached - the window holds the only host-side copy, gone when
-        it closes."""
+        it closes (or handed to the edit dialog by the Edit button, which
+        reuses the just-fetched values instead of asking the device for
+        every field again)."""
 
-        def __init__(self, parent, mono, fields):
+        def __init__(self, parent, mono, fields, on_edit=None):
             super().__init__(parent)
             self.title(fields.get("label") or fields.get("domain") or "Entry")
             self.configure(background=STYLE["bg"])
@@ -1474,10 +1906,22 @@ if HAVE_TK:
                         command=lambda e=entry: e.configure(
                             show="" if self.show_pw.get() else "*")
                     ).grid(row=i, column=2, sticky="w", padx=4)
-            ttk.Button(self, text="Close", command=self.destroy).grid(
-                row=len(rows), column=1, sticky="e", padx=8, pady=8)
+            self._on_edit = on_edit
+            btns = ttk.Frame(self)
+            btns.grid(row=len(rows), column=1, columnspan=2, sticky="e",
+                      padx=8, pady=8)
+            ttk.Button(btns, text="Close", command=self.destroy).pack(
+                side="right")
+            if on_edit is not None:
+                ttk.Button(btns, text="Edit", command=self._edit).pack(
+                    side="right", padx=6)
             self.bind("<Escape>", lambda e: self.destroy())
             self.grab_set()
+
+        def _edit(self):
+            on_edit = self._on_edit
+            self.destroy()
+            on_edit()
 
     class App(tk.Tk):
         def __init__(self, forced_port=None):
@@ -1495,17 +1939,32 @@ if HAVE_TK:
             self.connected = False
             self.busy = False
             self.view = "labels"          # or "web"
-            self.label_rows = []          # list of dicts
+            # Labels keep a mirror that survives without re-enumerating (see
+            # LabelRows). Web logins stay a plain list refreshed from the
+            # device after every change, because the duplicate check needs it
+            # to match the device exactly.
+            self.labels = LabelRows()
             self.web_rows = []
             # Each view's entries are enumerated lazily and independently - one
             # device confirmation each - and only the first time this session.
-            self.labels_loaded = False
             self.web_loaded = False
             self.sort_col = None
             self.sort_desc = False
             self.clip_value = None
             self.clip_after = None
             self.reveal_after = None
+            self.pending_dialog = None   # a Save waiting for the device
+            # What the version oracle said. None = firmware 2.6 or earlier
+            # (or not asked yet): the oracle itself arrived in 2.7, so its
+            # absence is the version signal. _device_at_least() is the gate
+            # for behavior that newer firmware does better.
+            self.fw_version = None
+            self.fw_used = None
+            self.fw_total = None
+            # Set once a device definitively answered "no oracle": that
+            # firmware cannot answer the probe, so stop asking. Only an
+            # app restart clears it.
+            self.skip_version_probe = False
 
             self._build_ui()
             # Open at the preferred size below. The widgets' own requested size
@@ -1541,47 +2000,83 @@ if HAVE_TK:
             ttk.Button(header, text="Help", command=self._show_help
                        ).pack(side="right", padx=6)
 
-            toolbar = ttk.Frame(self, padding=(10, 4))
-            toolbar.pack(fill="x")
-            self.load_btn = ttk.Button(toolbar, text="Load view",
+            ### Load row
+            row = ttk.Frame(self, padding=(10, 4))
+            row.pack(fill="x")
+            
+            self.load_btn = ttk.Button(row, text="Load view",
                                        style="CTA.TButton", command=self._load)
             self.load_btn.pack(side="left")
-            self.add_btn = ttk.Button(toolbar, text="+ Add", command=self._add)
+            # Only useful on a pre-2.7 device, where the label enumeration
+            # carries no groups; shown by _refresh_group_button for those and
+            # hidden otherwise (2.7+ loads groups with the labels already).
+            self.load_groups_btn = ttk.Button(row, text="Load view + groups",
+                                               command=self._load_groups)
+            _toolbar_rule(row)
+
+            self.load_single_btn = ttk.Button(row, text="Load single:",
+                                               command=self._load_single)
+            self.load_single_btn.pack(side="left", padx=(12, 0))
+            self.load_single_var = tk.StringVar()
+            self.single_entry = ttk.Entry(row, textvariable=self.load_single_var,
+                                          width=20, font=(self.mono, 11))
+            self.single_entry.pack(side="left", padx=6)
+            self.single_entry.bind("<Return>", lambda e: self._load_single())
+
+            self.view_var = tk.StringVar(value="All labels")
+            self.view_box = ttk.Combobox(
+                row, textvariable=self.view_var, state="readonly", width=25,
+                values=["All labels", "Web passwords (wwwfill)"])
+            self.view_box.pack(side="right")
+            self.view_box.bind("<<ComboboxSelected>>", lambda e: self._switch_view())
+            ttk.Label(row, text="View:").pack(side="right", padx=(0, 2))
+
+            ### Edit row
+            row = ttk.Frame(self, padding=(10, 2))
+            row.pack(fill="x")
+
+            self.add_btn = ttk.Button(row, text="+ Add", command=self._add)
             self.add_btn.pack(side="left", padx=4)
-            self.edit_btn = ttk.Button(toolbar, text="Edit", command=self._edit)
+            self.edit_btn = ttk.Button(row, text="Edit", command=self._edit)
             self.edit_btn.pack(side="left", padx=4)
-            self.show_entry_btn = ttk.Button(toolbar, text="Show entry",
-                                             command=self._show_entry)
-            self.show_entry_btn.pack(side="left", padx=4)
-            self.del_btn = ttk.Button(toolbar, text="Delete", command=self._delete)
+            self.del_btn = ttk.Button(row, text="Delete", command=self._delete)
             self.del_btn.pack(side="left", padx=4)
-            self.copy_user_btn = ttk.Button(toolbar, text="Copy username",
+
+            ### Copy row
+            row = ttk.Frame(self, padding=(10, 2))
+            row.pack(fill="x")
+
+            self.copy_user_btn = ttk.Button(row, text="Copy username",
                                             command=lambda: self._copy("username"))
             self.copy_user_btn.pack(side="left", padx=4)
-            self.copy_pw_btn = ttk.Button(toolbar, text="Copy password",
+            self.copy_pw_btn = ttk.Button(row, text="Copy password",
                                           command=lambda: self._copy("password"))
             self.copy_pw_btn.pack(side="left", padx=4)
-            self.copy_opt_btn = ttk.Button(toolbar, text="Copy optional",
+            self.copy_opt_btn = ttk.Button(row, text="Copy optional",
                                            command=self._copy_optional)
             self.copy_opt_btn.pack(side="left", padx=4)
 
-            ttk.Label(toolbar, text="Group:").pack(side="left", padx=(12, 2))
-            self.group_var = tk.StringVar(value="All labels")
-            self.group_box = ttk.Combobox(
-                toolbar, textvariable=self.group_var, state="readonly", width=22,
-                values=["All labels", "Web passwords (wwwfill)"])
-            self.group_box.pack(side="left")
-            self.group_box.bind("<<ComboboxSelected>>", lambda e: self._switch_view())
+            _toolbar_rule(row)
 
-            search = ttk.Frame(self, padding=(10, 2))
-            search.pack(fill="x")
-            ttk.Label(search, text="Search:").pack(side="left")
+            self.hide_btn = ttk.Button(row, text="Hide fields",
+                                       command=self._toggle_hidden)
+            self.hide_btn.pack(side="left", padx=4)
+            self.show_entry_btn = ttk.Button(row, text="Show entry",
+                                             command=self._show_entry)            
+            self.show_entry_btn.pack(side="left", padx=4)
+
+            ### Search row
+            row = ttk.Frame(self, padding=(10, 2))
+            row.pack(fill="x")
+
+            ttk.Label(row, text="Search:").pack(side="left", padx=(12, 0))
             self.search_var = tk.StringVar()
-            entry = ttk.Entry(search, textvariable=self.search_var, width=40,
+            entry = ttk.Entry(row, textvariable=self.search_var, width=40,
                               font=(self.mono, 11))
             entry.pack(side="left", padx=6)
             entry.bind("<KeyRelease>", lambda e: self._render())
-            self.count_label = ttk.Label(search, text="0 entries",
+
+            self.count_label = ttk.Label(row, text="0 entries",
                                          style="Muted.TLabel")
             self.count_label.pack(side="right")
 
@@ -1610,6 +2105,16 @@ if HAVE_TK:
                                       foreground=STYLE["white"], anchor="w",
                                       font=(self.mono, 11, "bold"))
             self.wait_text.pack(side="left", fill="x", expand=True, pady=4)
+            # The escape hatch for a wait the user will not finish: a
+            # confirmable command blocks with nothing on the wire until
+            # the device's prompt is answered. Interrupting is safe - the
+            # transport flushes any late response before the next command
+            # goes out.
+            self.stop_btn = tk.Button(self.wait_bar, text="Stop waiting",
+                                      command=self.worker.wake,
+                                      font=(self.mono, 10))
+            self.stop_btn.pack(side="right", padx=10, pady=2)
+            self.stop_btn.pack_forget()   # shown only while waiting
             self.wait_bar.pack(fill="x", side="bottom")
             self.status = ttk.Label(self, text="Starting...", style="Status.TLabel",
                                     anchor="w", padding=(10, 4))
@@ -1638,6 +2143,12 @@ if HAVE_TK:
                     self.last_seen_port = port
                 if port:
                     self.worker.submit("open", port=port)
+            elif not self.busy:
+                # While connected and idle nothing touches the port, so an
+                # unplugged cable fails no I/O and would never reach the UI.
+                # Skipped while busy: the in-flight command is already the
+                # probe, and pings would pile up behind a long confirmation.
+                self.worker.submit("ping")
             self.after(1000, self._poll_port)
 
         def _poll_events(self):
@@ -1657,28 +2168,90 @@ if HAVE_TK:
             self.connected = True
             self.conn_label.configure(text="● connected",
                                       foreground=STYLE["green"])
-            self._set_status("Connected  -  %s  -  click Load view" % data["port"])
             self._update_actions()
+            self._refresh_group_button()
+            # A device already found to predate the oracle cannot answer
+            # the probe, so re-probing on every reconnect would only cost
+            # an Ask-all confirmation for a known answer. A different or
+            # upgraded device is re-detected after an app restart.
+            if self.skip_version_probe:
+                self._set_status(
+                    "Connected - firmware 2.6 or earlier - click Load view")
+                return
+            # First thing on every connection: ask what device this is.
+            # Instant and promptless in the Normal and Allow all access
+            # modes; in Ask all the device may raise one confirmation,
+            # which the wait bar explains.
+            self._begin_wait("Checking the device's firmware version...")
+            self.worker.submit("query_version")
+
+        def _ev_fw_info(self, data):
+            self._end_wait()
+            self.skip_version_probe = data["definite"] and data["version"] is None
+            self.fw_version = data["version"]
+            self.fw_used = data["used"]
+            self.fw_total = data["total"]
+            if self.fw_version is None:
+                fw = "firmware 2.6 or earlier"
+            elif self.fw_used is not None:
+                fw = ("firmware %s, %d of %d entries used"
+                      % (self.fw_version, self.fw_used, self.fw_total))
+            else:
+                fw = "firmware %s" % self.fw_version
+            self._set_status("Connected - %s - click Load view" % fw)
+            self._refresh_group_button()
 
         def _ev_disconnected(self, data):
             self.connected = False
             self._end_wait()
             # A new session re-latches on the device, so the next enumeration will
-            # prompt again - forget what was loaded (rows stay visible read-only).
-            self.labels_loaded = False
+            # prompt again - forget what was loaded. The device may also change
+            # behind our back while we are away, so the label mirror is no
+            # longer known to be complete.
+            self.labels.complete = False
             self.web_loaded = False
+            # Whatever reconnects may be a different device or firmware.
+            self.fw_version = self.fw_used = self.fw_total = None
+            # The trusted path just left the desk: the revealed sensitive
+            # fields go back to not-read, while labels and groups stay to
+            # keep the table navigable.
+            self.labels.forget(*SENSITIVE_FIELDS)
+            self._render()
+            self._release_dialog("Device disconnected - reconnect, then "
+                                 "Save again; the values are still here.")
             self.conn_label.configure(text="● disconnected",
                                       foreground=STYLE["muted"])
+            self._refresh_group_button()
             self._set_status('Device disconnected - re-enter "Usb slave" on the '
-                             "device to reconnect. Loaded rows stay visible.")
+                             "device to reconnect. Labels and groups stay; "
+                             "other revealed fields were cleared.")
             self._update_actions()
 
         def _ev_loaded_labels(self, data):
             self._end_wait()
-            self.labels_loaded = True
-            self.label_rows = [{"label": lbl, "group": None, "username": None,
-                                "optional": None} for lbl in data["labels"]]
-            self._set_status("Loaded %d labels." % len(self.label_rows))
+            # Fields revealed earlier survive this; only the set of labels is
+            # replaced.
+            self.labels.replace_all(data["labels"])
+            # Firmware 2.7+ answers the group alongside each label - the
+            # same enumeration and confirmation, so the group column fills
+            # without a per-label read.
+            for label, group in (data.get("groups") or {}).items():
+                self.labels.reveal(label, group=group)
+            self._set_status(f"Loaded {len(self.labels)} labels.")
+            self._render()
+            # The pre-2.7 group load stops the moment the device is seen to
+            # prompt per entry; point the user at the access-mode setting so
+            # the rest of the groups can load without a confirmation each.
+            if data.get("groups_prompting"):
+                self._warn_group_load_prompts()
+
+        def _ev_loaded_label_and_group(self, data):
+            # One entry, one confirmation: it joins the table without the full
+            # enumeration a "Show all labels" prompt would cost. The mirror
+            # stays incomplete - this says nothing about the other entries.
+            self._end_wait()
+            self.labels.reveal(data["label"], group=data["group"])
+            self._set_status(f"Loaded {data['label']}.")
             self._render()
 
         def _ev_loaded_web(self, data):
@@ -1705,6 +2278,18 @@ if HAVE_TK:
                            "copies first." % names)
                 messagebox.showwarning("Seclave Companion", message)
                 self._set_status(message)
+            if any(latin1_fold(row["domain"]) == latin1_fold(VERSION_DOMAIN)
+                   for row in self.web_rows):
+                # Only reachable on firmware that does not reserve the name -
+                # 2.6 or earlier - and only if some other tool stored it. The
+                # row stays listed rather than being hidden, so it can be
+                # deleted from here.
+                message = ("The device holds a web password under the name "
+                           "reserved for version discovery. That is only "
+                           "possible on firmware 2.6 or earlier, and it makes "
+                           "version detection unreliable - delete that entry.")
+                messagebox.showwarning("Seclave Companion", message)
+                self._set_status(message)
 
         def _ev_secret(self, data):
             secret = data["secret"]
@@ -1714,12 +2299,10 @@ if HAVE_TK:
                              % (data["field"], CLIPBOARD_CLEAR_MS // 1000))
 
         def _ev_optional(self, data):
-            # Optional is not a secret, so it also lands in the table and stays
-            # until the next reload.
+            # Optional is not a secret, so it also lands in the table - and
+            # stays there, a later enumeration included.
             self._end_wait()
-            for row in self.label_rows:
-                if row["label"] == data["label"]:
-                    row["optional"] = data["value"]
+            self.labels.reveal(data["label"], optional=data["value"])
             self._render()
             self._put_clipboard(data["value"])
             self._set_status("Copied optional to clipboard - clears in %d s."
@@ -1734,56 +2317,121 @@ if HAVE_TK:
             password = data["password"].text()
             data["password"].clear()
             # Group, username and optional now stand revealed by the user's own
-            # confirmations - reflect them in the table.
-            for row in self.label_rows:
-                if row["label"] == data["label"]:
-                    row["group"] = data["group"]
-                    row["username"] = username
-                    row["optional"] = data["optional"]
+            # confirmations - reflect them in the table, where they stay.
+            self.labels.reveal(data["label"], group=data["group"],
+                               username=username, optional=data["optional"])
             self._render()
             fields = {"web": False, "label": data["label"],
                       "group": data["group"], "username": username,
-                      "password": password, "optional": data["optional"]}
-            if data["purpose"] == "edit":
-                fields["_old_label"] = data["label"]
-                EntryDialog(self, self.mono, self._on_dialog_save,
-                            existing=fields)
-            else:
-                EntryViewer(self, self.mono, fields)
+                      "password": password, "optional": data["optional"],
+                      "_old_label": data["label"]}
+            self._show_fetched(fields, data["purpose"])
 
         def _ev_wwwfill_fields(self, data):
             self._end_wait()
             password = data["password"].text()
             data["password"].clear()
             fields = {"web": True, "domain": data["domain"],
-                      "username": data["username"], "password": password}
-            if data["purpose"] == "edit":
-                fields["_old_domain"] = data["domain"]
-                fields["_old_username"] = data["username"]
+                      "username": data["username"], "password": password,
+                      "_old_domain": data["domain"],
+                      "_old_username": data["username"]}
+            self._show_fetched(fields, data["purpose"])
+
+        def _show_fetched(self, fields, purpose):
+            """Open the fetched entry for the purpose it was fetched for. The
+            viewer's Edit button reuses the same values: every field was just
+            read under the user's confirmations, so switching to edit must
+            not cost a second round of them."""
+            if purpose == "edit":
                 EntryDialog(self, self.mono, self._on_dialog_save,
                             existing=fields)
             else:
-                EntryViewer(self, self.mono, fields)
+                EntryViewer(self, self.mono, fields,
+                            on_edit=lambda: EntryDialog(
+                                self, self.mono, self._on_dialog_save,
+                                existing=fields))
 
         def _ev_saved(self, data):
             self._end_wait()
-            # Refresh only the view the change touched. Within a session the
-            # device latches the first enumeration confirmation, so re-enumerating
-            # needs no new prompt.
+            self._release_dialog()
+            old_remains = data.get("old_remains")
             if data["view"] == "web":
+                if old_remains:
+                    message = ("Saved the new web password, but deleting "
+                               "the old one (%s) %s - remove it from the "
+                               "list when convenient."
+                               % (data["old_pair"], old_remains))
+                    messagebox.showwarning("Seclave Companion", message)
+                    self._set_status(message)
+                # Re-enumerate: the duplicate check reads web_rows as an exact
+                # picture of the device. Within a session the first
+                # enumeration confirmation is latched, so this costs no prompt.
                 self.worker.submit("load_web")
                 self._begin_wait("Refreshing web passwords...")
+                return
+            # Labels are mirrored instead of re-read. The change was ours, so
+            # its effect on the device is known exactly, and a user who never
+            # enumerated keeps working with the entries they have touched.
+            action, label = data["action"], data["label"]
+            if action == "delete":
+                self.labels.remove(label)
+                self._set_status(f"Deleted {label}.")
             else:
-                self.worker.submit("load_labels")
-                self._begin_wait("Refreshing labels...")
+                fields = {name: data[name] for name in TABLE_FIELDS}
+                if action == "edit" and not old_remains:
+                    self.labels.replace(data["old_label"], label, **fields)
+                else:
+                    # A plain add, or a rename whose old entry is still on
+                    # the device - its row stays until it really goes.
+                    self.labels.reveal(label, **fields)
+                verb = "Saved" if action == "edit" else "Added"
+                if old_remains:
+                    message = (f"{verb} {label}, but deleting the old entry "
+                               f"{data['old_label']} {old_remains} - remove "
+                               "it when convenient.")
+                    messagebox.showwarning("Seclave Companion", message)
+                    self._set_status(message)
+                else:
+                    self._set_status(f"{verb} {label}.")
+            self._render()
+
+        def _ev_save_pending(self, data):
+            # Firmware 2.6 and earlier answered "exists" and is showing its
+            # Replace prompt: the entry keeps its old values on a decline
+            # and takes the new ones on a confirm, and the device never
+            # says which. Nothing is lost either way, so the dialog closes;
+            # what the edit changed is unread until it is read again.
+            self._end_wait()
+            self._release_dialog()
+            if data["view"] == "labels":
+                unread = [name for name in data["changed"]
+                          if name in TABLE_FIELDS]
+                if unread:
+                    self.labels.unread(data["label"], *unread)
+                    self._render()
+                message = ("Answer Replace on the device: %s keeps its old "
+                           "values on a decline. The choice is not "
+                           "reported, so the changed fields show as unread."
+                           % data["label"])
+            else:
+                message = ("Answer Replace on the device: the web password "
+                           "keeps its old or new value. A later copy shows "
+                           "the one that survived.")
+            self._set_status(message)
 
         def _ev_declined(self, data):
             self._end_wait()
+            self._release_dialog("Declined (or stopped) - nothing was "
+                                 "changed by this step. The values are "
+                                 "still here; Save to try again.")
             self._set_status("Declined on device.")
 
         def _ev_error(self, data):
             self._end_wait()
-            messagebox.showwarning("Seclave Companion", data["message"])
+            if self.pending_dialog is not None:
+                self._release_dialog(data["message"])
+            else:
+                messagebox.showwarning("Seclave Companion", data["message"])
             self._set_status(data["message"])
 
         def _ev_failed(self, data):
@@ -1791,6 +2439,9 @@ if HAVE_TK:
             # per retry would bury the window.
             self.connected = False
             self._end_wait()
+            self._release_dialog("%s failed - %s. The values are still "
+                                 "here; Save to try again."
+                                 % (data["request"], data["message"]))
             self._set_status("%s failed - %s" % (data["request"], data["message"]))
             self._update_actions()
 
@@ -1808,19 +2459,59 @@ if HAVE_TK:
                                  '"Show all wwwfills".')
                 self.worker.submit("load_web")
             else:
-                self.labels_loaded = False
+                self.labels.complete = False
                 self._begin_wait("Loading - look at your Seclave and confirm "
                                  '"Show all labels".')
-                self.worker.submit("load_labels")
+                self.worker.submit("load_labels",
+                                   with_groups=self._device_at_least(2, 7))
+
+        def _load_groups(self):
+            # Pre-2.7 only (the button is hidden otherwise): load the labels and
+            # then their groups one read at a time. Promptless in "Allow all"
+            # access mode; in the other modes it stops at the first prompt and
+            # the wait's end explains how to change the mode.
+            if not self._require_connection():
+                return
+            self.labels.complete = False
+            self._begin_wait('Loading labels - confirm "Show all labels" - '
+                             "then the groups one by one.")
+            self.worker.submit("load_labels_groups")
+
+        def _warn_group_load_prompts(self):
+            messagebox.showwarning(
+                "Load view + groups",
+                "This device asks you to confirm each group on the Seclave, so "
+                "loading every group would prompt you once per entry.\n\n"
+                "To load them all at once, set the device to \"Allow all\" "
+                "access: on the Seclave, Admin -> Slave security -> Allow all, "
+                "then click \"Load view + groups\" again.\n\n"
+                "Careful: in \"Allow all\" mode any computer connected over USB "
+                "can read every label, group, username, password and note "
+                "without asking you to confirm on the device. Use it only on a "
+                "computer you trust, and set Slave security back to \"Normal\" "
+                "when you are done.")
 
         def _switch_view(self):
-            self.view = "web" if self.group_var.get().startswith("Web") else "labels"
+            self.view = "web" if self.view_var.get().startswith("Web") else "labels"
             self.sort_col = None
             self._configure_columns()
+            self._refresh_group_button()
             self._render()
             # Enumerate this view the first time it is shown; if it is already
             # loaded this session the switch is purely local (no reconfirm).
             self._ensure_loaded()
+
+        def _refresh_group_button(self):
+            # The pre-2.7 group load belongs to the labels view of a device that
+            # cannot fold groups into the enumeration. Shown only there, packed
+            # right after the main Load button, hidden everywhere else.
+            show = (self.connected and self.view == "labels"
+                    and not self._device_at_least(2, 7))
+            if show and not self.load_groups_btn.winfo_ismapped():
+                self.load_groups_btn.pack(side="left", padx=4,
+                                          after=self.load_btn)
+            elif not show and self.load_groups_btn.winfo_ismapped():
+                self.load_groups_btn.pack_forget()
 
         def _ensure_loaded(self):
             if self.busy or not self.connected:
@@ -1829,26 +2520,39 @@ if HAVE_TK:
                 self._begin_wait("Loading - look at your Seclave and confirm "
                                  '"Show all wwwfills".')
                 self.worker.submit("load_web")
-            elif self.view == "labels" and not self.labels_loaded:
+            elif self.view == "labels" and not self.labels.complete:
                 self._begin_wait("Loading - look at your Seclave and confirm "
                                  '"Show all labels".')
-                self.worker.submit("load_labels")
+                self.worker.submit("load_labels",
+                                   with_groups=self._device_at_least(2, 7))
 
         def _sort_by(self, col):
-            self.sort_desc = not self.sort_desc if self.sort_col == col else False
-            self.sort_col = col
+            # Cycle: first click sorts ascending, second flips descending, a
+            # third returns to the default order - lexical by label under
+            # the device's own case fold, the order rows() always yields.
+            if self.sort_col != col:
+                self.sort_col, self.sort_desc = col, False
+            elif not self.sort_desc:
+                self.sort_desc = True
+            else:
+                self.sort_col, self.sort_desc = None, False
             self._render()
 
         def _render(self):
-            rows = self.web_rows if self.view == "web" else self.label_rows
+            rows = self.web_rows if self.view == "web" else self.labels.rows()
             needle = self.search_var.get().lower()
             keys = ("domain", "username") if self.view == "web" else \
-                ("label", "group", "username", "optional")
+                ("label",) + TABLE_FIELDS
             visible = [r for r in rows
                        if not needle or any(needle in str(r.get(k) or "").lower()
                                             for k in keys)]
             if self.sort_col:
-                visible.sort(key=lambda r: str(r.get(self.sort_col) or "").lower(),
+                # Sort under the device's case fold, not str.lower(): the
+                # fold is what orders the default view and what the device
+                # itself compares with, and Python folds letters (E-acute,
+                # sharp-s) the device keeps distinct.
+                visible.sort(key=lambda r: latin1_fold(
+                                 str(r.get(self.sort_col) or "")),
                              reverse=self.sort_desc)
             self.tree.delete(*self.tree.get_children())
             self.row_by_iid = {}
@@ -1856,8 +2560,15 @@ if HAVE_TK:
                 if self.view == "web":
                     values = (row["domain"], row["username"])
                 else:
-                    values = (row["label"], row["group"] or "•••",
-                              row["username"] or "•••", row["optional"] or "•••")
+                    # None means "not revealed yet", which an empty string -
+                    # a field the device really does hold empty - is not.
+                    # A hidden row masks its revealed sensitive fields,
+                    # without losing them.
+                    values = (row["label"],) + tuple(
+                        UNKNOWN_FIELD if row[name] is None else
+                        HIDDEN_FIELD if row["hidden"] and
+                        name in SENSITIVE_FIELDS else row[name]
+                        for name in TABLE_FIELDS)
                 iid = str(i)
                 self.tree.insert("", "end", iid=iid, values=values)
                 self.row_by_iid[iid] = row
@@ -1880,10 +2591,19 @@ if HAVE_TK:
                 self._begin_wait("Fetching %s..." % field)
                 self.worker.submit("copy_wwwfill", domain=row["domain"],
                                    index=row["index"], field=field)
-            else:
-                self._begin_wait("Look at your Seclave - confirm showing the "
-                                 "%s for %s." % (field, row["label"]))
-                self.worker.submit("copy_field", label=row["label"], field=field)
+                return
+            if field == "username" and row["username"] is not None:
+                # Revealed earlier under its own confirmation - reuse it, as
+                # _copy_optional does, instead of asking the device (and the
+                # user) again. The password is never in the row, so a copy of
+                # it is always a fresh, confirmed read.
+                self._put_clipboard(row["username"])
+                self._set_status("Copied username to clipboard - clears in "
+                                 "%d s." % (CLIPBOARD_CLEAR_MS // 1000))
+                return
+            self._begin_wait("Look at your Seclave - confirm showing the "
+                             "%s for %s." % (field, row["label"]))
+            self.worker.submit("copy_field", label=row["label"], field=field)
 
         def _copy_optional(self):
             # Optional is fetched lazily (a confirmable read on the device),
@@ -1959,14 +2679,97 @@ if HAVE_TK:
             else:
                 self.worker.submit("del_entry", label=row["label"])
 
-        def _on_dialog_save(self, data, existing):
+        def _toggle_hidden(self):
+            # Purely local - no device action - so unlike the other toolbar
+            # buttons it stays available while disconnected or waiting:
+            # exactly when a table left on screen needs covering.
+            row = self._selected_row()
+            if row is None:
+                return
+            if self.view == "web":
+                self._set_status("Web rows show only what the enumeration "
+                                 "listed - there is nothing to hide.")
+                return
+            if self.labels.toggle_hidden(row["label"]):
+                self._set_status("Hid %s - the fields stay in memory, so "
+                                 "showing or copying them again is free."
+                                 % row["label"])
+            else:
+                self._set_status("Showing %s again." % row["label"])
+            self._render()
+            for iid, r in self.row_by_iid.items():
+                if r is row:   # keep the row selected for the next toggle
+                    self.tree.selection_set(iid)
+                    break
+
+        def _load_single(self):
+            # One named entry into the table, for when the user will not spend
+            # a "Show all labels" confirmation. Reading its group is what
+            # proves to the device that the label exists.
+            if not self._require_connection():
+                return
+            label = self.load_single_var.get().strip()
+            if not label:
+                self._set_status("Type the label of the entry to load.")
+                return
+            problem = validate_restricted(label, MAX_LABEL, allow_empty=False)
+            if problem:
+                self._set_status(f"Label: {problem}")
+                return
+            row = self.labels.get(label)
+            if row is not None and row["group"] is not None:
+                # Already read this session - the mirror keeps it, so a second
+                # device confirmation would buy nothing.
+                self._set_status(f"{row['label']} is already loaded.")
+                self.load_single_var.set("")
+                return
+            self._begin_wait("Look at your Seclave - confirm showing the "
+                             f"group for {label}.")
+            self.worker.submit("load_single", label=label)
+            self.load_single_var.set("")
+
+        def _release_dialog(self, message=None):
+            """Resolve a Save waiting in a dialog: close it on success, or
+            re-arm it with `message` so the typed values - the password
+            above all - survive the failure for another try."""
+            dialog, self.pending_dialog = self.pending_dialog, None
+            if dialog is None or not dialog.winfo_exists():
+                return
+            if message is None:
+                dialog.destroy()
+            else:
+                dialog.save_failed(message)
+
+        def _label_collision_problem(self, data, existing):
+            # A put onto a label that already exists raises the device's
+            # "Replace label?" prompt for that other entry, and firmware 2.6
+            # and earlier never reports the choice - confirming it would
+            # silently overwrite an entry the user did not mean to touch.
+            # Refuse while the mirror knows the label is taken; like the
+            # rest of the mirror this cannot see entries never loaded, so it
+            # is a best-effort guard.
+            row = self.labels.get(data["label"])
+            if row is None:
+                return None
+            if existing and "_old_label" in existing and \
+                    latin1_fold(existing["_old_label"]) == \
+                    latin1_fold(data["label"]):
+                return None   # an edit keeping its own label is no collision
+            return ("An entry labeled %s already exists - edit that entry "
+                    "instead, or delete it first." % row["label"])
+
+        def _on_dialog_save(self, data, existing, dialog=None):
             """Submit a dialog Save to the worker. Returns None when the
             request was sent, or a message for the dialog to show - the entry
             is then not sent and the dialog stays open."""
             if data["web"]:
-                problem = self._wwwfill_duplicate_problem(data, existing)
-                if problem:
-                    return problem
+                problem = (self._reserved_domain_problem(data) or
+                           self._wwwfill_duplicate_problem(data, existing))
+            else:
+                problem = self._label_collision_problem(data, existing)
+            if problem:
+                return problem
+            self.pending_dialog = dialog
             self._begin_wait("Look at your Seclave - confirm on the device.")
             if data["web"]:
                 if existing and "_old_domain" in existing:
@@ -1983,10 +2786,29 @@ if HAVE_TK:
                 fields = {k: data[k] for k in
                           ("label", "group", "username", "password", "optional")}
                 if existing and "_old_label" in existing:
+                    # The worker needs to know what the edit changed: on old
+                    # firmware an in-place replace does not report whether it
+                    # happened, and only the changed fields become unknown.
+                    changed = [k for k in
+                               ("group", "username", "password", "optional")
+                               if fields[k] != existing.get(k)]
                     self.worker.submit("edit_entry",
-                                       old_label=existing["_old_label"], **fields)
+                                       old_label=existing["_old_label"],
+                                       old_group=existing.get("group"),
+                                       changed=changed, **fields)
                 else:
                     self.worker.submit("put_entry", **fields)
+            return None
+
+        def _reserved_domain_problem(self, data):
+            # Version discovery reads this name (see VERSION_DOMAIN), so an
+            # entry stored under it would shadow the probe on firmware that
+            # does not reserve the name itself. The domain arriving here is
+            # already normalized by the dialog; both sides are folded because
+            # the device treats the cased forms as the same name.
+            if latin1_fold(data["domain"]) == latin1_fold(VERSION_DOMAIN):
+                return ("This name is reserved for the device's version "
+                        "discovery and cannot hold a web password.")
             return None
 
         def _wwwfill_duplicate_problem(self, data, existing):
@@ -2047,6 +2869,18 @@ if HAVE_TK:
 
         # ---- shared state helpers ----
 
+        def _device_at_least(self, major, minor):
+            """Whether the connected device's firmware is at or past a
+            version - the gate for choosing behavior per firmware. Unknown
+            or pre-oracle firmware counts as oldest."""
+            if self.fw_version is None:
+                return False
+            parts = self.fw_version.split(".")
+            try:
+                return (int(parts[0]), int(parts[1])) >= (major, minor)
+            except (ValueError, IndexError):
+                return False
+
         def _require_connection(self):
             if self.busy:
                 self._set_status("Wait for the current device action to finish.")
@@ -2062,6 +2896,7 @@ if HAVE_TK:
             self.wait_bar.configure(background=STYLE["red"])
             self.wait_dot.configure(text="⬤", background=STYLE["red"])
             self.wait_text.configure(text=message, background=STYLE["red"])
+            self.stop_btn.pack(side="right", padx=10, pady=2)
             self._update_actions()
 
         def _end_wait(self):
@@ -2069,6 +2904,7 @@ if HAVE_TK:
             self.wait_bar.configure(background=STYLE["bg"])
             self.wait_dot.configure(text="", background=STYLE["bg"])
             self.wait_text.configure(text="", background=STYLE["bg"])
+            self.stop_btn.pack_forget()
             self._update_actions()
 
         def _set_status(self, text):
@@ -2076,39 +2912,51 @@ if HAVE_TK:
 
         def _update_actions(self):
             live = "normal" if (self.connected and not self.busy) else "disabled"
-            for btn in (self.load_btn, self.add_btn, self.edit_btn,
-                        self.show_entry_btn, self.del_btn, self.copy_user_btn,
-                        self.copy_pw_btn, self.copy_opt_btn):
+            for btn in (self.load_btn, self.load_groups_btn, self.add_btn,
+                        self.edit_btn, self.show_entry_btn, self.del_btn,
+                        self.copy_user_btn, self.copy_pw_btn, self.copy_opt_btn,
+                        self.load_single_btn):
                 btn.configure(state=live)
+            # hide_btn is absent on purpose: hiding touches no device and is
+            # wanted most exactly when the device is gone and the loaded rows
+            # are left showing.
 
         def _show_help(self):
             messagebox.showinfo(
                 "About Seclave Companion",
-                "Seclave Companion %s\n\n"
-                "A desktop table view for your Seclave 2.0 over its USB-slave "
-                "serial protocol. Put the device in its \"Usb slave\" menu, then "
-                "click Load view. Labels and web passwords load separately - one "
-                "device confirmation each, when you first show that view.\n\n"
-                "Access modes: the device may ask you to confirm each read on "
-                "its screen (Normal / Ask all), or allow them silently (Allow "
-                "all). The app cannot read the current mode, so it always shows "
-                "the confirm hint; if the device is set to Allow all it simply "
-                "returns at once.\n\n"
-                "Web passwords (wwwfill) are read and written without a device "
-                "prompt in Normal mode - that path is intentionally "
-                "frictionless.\n\n"
-                "Secrets are fetched only when you ask, copied to the clipboard, "
-                "and the clipboard clears after %d seconds and on exit.\n\n"
-                "Show entry reads every field of the selected row (confirming "
-                "on the device) into a read-only window; Edit does the same and "
-                "opens the dialog prefilled."
-                % (VERSION, CLIPBOARD_CLEAR_MS // 1000))
+                "Seclave Companion %s\n"
+                "Copyright (c) 2026 Seclave AB"
+                % (VERSION))
 
         def _on_close(self):
             self._clear_clipboard()
             self.worker.submit("quit")
             self.worker.wake()
             self.destroy()
+
+
+def disable_core_dumps():
+    """Set the core dump size limit to zero, where the platform has one.
+
+    A core dump is a copy of exactly what the wiping above exists to control,
+    and the kernel writes it at the moment of a crash - no `finally` gets to
+    run first, so nothing else in this file can prevent it. Zeroing the limit
+    is what makes the arena and SecretBuffer wiping worth doing: it closes the
+    one path by which secret bytes reach the disk.
+
+    POSIX only. Windows crash dumps are configured machine-wide through Windows
+    Error Reporting, so there is nothing for a program to set there.
+    """
+    try:
+        import resource
+    except ImportError:
+        return
+    try:
+        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+    except (OSError, ValueError) as err:
+        # Not fatal: the app runs on with whatever limit it inherited, which is
+        # the pre-existing behavior. Trace it so --debug can show it happened.
+        debug("could not disable core dumps: %s", err)
 
 
 def main(argv=None):
@@ -2122,6 +2970,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if args.debug:
         enable_debug()
+    disable_core_dumps()
     if not HAVE_TK:
         # tkinter is part of the standard library but is built against the
         # Tcl/Tk C libraries, so it cannot be installed from PyPI: it comes
