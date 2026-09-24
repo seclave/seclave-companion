@@ -113,9 +113,15 @@ so leaving it (or pressing UP) disconnects the app. Then:
    device; every field then appears in a read-only window, password masked
    until you tick "show", and stays filled in on the table afterwards.
 3. **Copy username**, **Copy password** and **Copy optional** put one value on
-   the clipboard. It clears after 30 seconds, and on exit.
+   the clipboard. It clears after 30 seconds, and on exit. Double-clicking a
+   row, anywhere on it, is a shortcut for **Copy password**: the same
+   confirmation on the device, the same 30-second clipboard.
 4. **+ Add**, **Edit** and **Delete** change entries, each confirmed on the
-   device. In the dialog, the **8 / 12 / 16 / 20** buttons beside the password
+   device. The **Type** switch at the top of the Add dialog picks a
+   **Regular** entry (label, group, username, password, optional) or a **Web
+   password** (domain, username, password), which lands in the wwwfill view;
+   an existing entry keeps its type when edited. In the dialog, the
+   **8 / 12 / 16 / 20** buttons beside the password
    field generate one of that length. A save that is declined or fails keeps
    everything you typed, so a rejected save cannot lose an entry.
    The **→ Tab** and **↵ Enter** buttons beside the username, password and
@@ -146,7 +152,8 @@ so leaving it (or pressing UP) disconnects the app. Then:
    `XXXXXXXX-XXXXXXXX-XXXXXXXX-XXXXXXXX`), and the entries open in a
    read-only table - label, group, username and optional in the clear, the
    password shown only on request for the selected row, or in the full-entry
-   view. From there **Export JSON / CSV / YAML** writes every entry,
+   view (**Show entry**, or double-click a row - here a double-click opens
+   the entry rather than copying anything). From there **Export JSON / CSV / YAML** writes every entry,
    passwords included, to a plain file. Mind the warning the button shows
    first: an opened backup bypasses the device's per-read confirmations -
    every password in it is exposed to the computer, so do this only on a
