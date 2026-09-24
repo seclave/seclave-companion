@@ -140,6 +140,25 @@ def main():
     assert app.clipboard_get() == "hunter2", repr(app.clipboard_get())
     print("password fetch reached clipboard OK")
 
+    # The timed clear overwrites rather than disowns: a selection owner
+    # with nothing to serve hangs some terminals' paste (Alacritty), so a
+    # single space stands in for "nothing".
+    app._clear_clipboard()
+    assert app.clipboard_get() == " ", repr(app.clipboard_get())
+    assert app.clip_value is None
+    print("clipboard clear leaves a space, not an empty-handed owner")
+
+    # ...and it reads before it writes: content the user copied somewhere
+    # else in the meantime is not ours to clobber. (A copy racing the
+    # overwrite itself can still lose - accepted, the window is tiny.)
+    app._put_clipboard("ours")
+    app.clipboard_clear()
+    app.clipboard_append("theirs")
+    app._clear_clipboard()
+    assert app.clipboard_get() == "theirs", repr(app.clipboard_get())
+    assert app.clip_value is None
+    print("clipboard clear leaves foreign content alone")
+
     # Copy optional: fetches once (revealing it in the table), then reuses
     # the shown value with no second device read.
     select("gmail")
@@ -509,6 +528,127 @@ def main():
         (r["domain"], r["username"]) for r in app.web_rows], app.web_rows
     print("stored reserved name warned at load, row still listed")
 
+    # The Tab and Enter keys put a marker in the field, and what the device
+    # is asked to store is the control character it stands for.
+    puts_before = device.op_counts.get(sc.OP_PUT_ENTRY, 0)
+    dlg = sc.EntryDialog(app, app.mono, app._on_dialog_save)
+    dlg.vars["label"].set("marked")
+    entry = dlg.rows["password"][1]
+    entry.insert("end", "pw")
+    # Each key lands at the insertion cursor, not at the end of the field.
+    entry.icursor("end")
+    dlg._insert_mark("password", sc.MARK_RET)
+    entry.icursor(0)
+    dlg._insert_mark("password", sc.MARK_TAB)
+    assert dlg.vars["password"].get() == sc.MARK_TAB + "pw" + sc.MARK_RET, \
+        dlg.vars["password"].get()
+    assert dlg._field("password") == "\tpw\n", repr(dlg._field("password"))
+    # A marker stands for one byte, so the counter reads 4 and not 2.
+    assert dlg.rows["password"][2].cget("text") == f"4/{sc.MAX_PASSWORD}", \
+        dlg.rows["password"][2].cget("text")
+    dlg._save()
+    pump(app, 1.0)
+    assert not dlg.winfo_exists(), "marked save left the dialog open"
+    assert device.op_counts.get(sc.OP_PUT_ENTRY, 0) == puts_before + 1
+    assert device.entries["marked"]["password"] == "\tpw\n", \
+        repr(device.entries["marked"]["password"])
+    print("Tab and Enter keys store real control characters")
+
+    # A pasted control character normalizes to its marker, so nothing sits in
+    # the field invisibly - and a pasted CR becomes the newline it meant.
+    dlg = sc.EntryDialog(app, app.mono, app._on_dialog_save)
+    dlg.vars["username"].set("a\tb\r\nc\rd")
+    assert dlg.vars["username"].get() == \
+        "a" + sc.MARK_TAB + "b" + sc.MARK_RET + "c" + sc.MARK_RET + "d", \
+        dlg.vars["username"].get()
+    assert dlg._field("username") == "a\tb\nc\nd", repr(dlg._field("username"))
+    # The restricted fields get no keys and no normalizing: a control
+    # character pasted there is refused rather than made to look storable.
+    dlg.vars["label"].set("bad\tlabel")
+    assert dlg.vars["label"].get() == "bad\tlabel"
+    dlg._save()
+    assert "not allowed" in dlg.error.cget("text"), dlg.error.cget("text")
+    # A web entry has no optional field, so its keys go with it - they sit in
+    # a frame of their own and would otherwise be left behind on an empty row.
+    dlg.is_web.set(True)
+    dlg._refresh_fields()
+    pump(app, 0.2)
+    assert not dlg.extras["optional"].winfo_ismapped(), \
+        "the optional field's keys outlived the field"
+    assert dlg.extras["password"].winfo_ismapped()
+    dlg.is_web.set(False)
+    dlg._refresh_fields()
+    pump(app, 0.2)
+    assert dlg.extras["optional"].winfo_ismapped()
+    dlg.destroy()
+    print("pasted controls become markers; restricted fields refuse them")
+
+    # Read-back shows the markers again, in the table and in the viewer.
+    app.view_var.set("All labels")
+    app._switch_view()
+    app.labels.reveal("marked", username="u\tv")
+    app._render()
+    shown = [app.tree.item(i, "values") for i in app.tree.get_children()
+             if app.row_by_iid[i]["label"] == "marked"]
+    assert shown and "u" + sc.MARK_TAB + "v" in shown[0], shown
+    viewer = sc.EntryViewer(app, app.mono,
+                            {"web": False, "label": "marked",
+                             "username": "u\tv", "password": "p\nq",
+                             "group": "", "optional": ""})
+    assert viewer.vars[2].get() == "u" + sc.MARK_TAB + "v", viewer.vars[2].get()
+    assert viewer.vars[3].get() == "p" + sc.MARK_RET + "q", viewer.vars[3].get()
+    viewer.destroy()
+    print("stored controls show as markers in the table and the viewer")
+
+    # Import JSON: the file validates as a whole, then every entry is sent -
+    # existing labels included, so an import can update passwords. The stub
+    # answers "exists" for github like firmware 2.6, whose Replace prompt
+    # owns the outcome: the row's fields turn unread. Nothing is enumerated
+    # first. The blocking dialogs are patched away for the headless run.
+    import tempfile as _tf
+    puts_before = device.op_counts.get(sc.OP_PUT_ENTRY, 0)
+    enum_before = device.op_counts.get(sc.OP_GET_LABELIDX, 0)
+    assert app.labels.get("github")["group"] == "work"
+    infos = []
+    real_open = sc.filedialog.askopenfilename
+    real_ok = sc.messagebox.askokcancel
+    real_info = sc.messagebox.showinfo
+    with _tf.TemporaryDirectory() as tmp:
+        ipath = os.path.join(tmp, "import.json")
+        with open(ipath, "w", encoding="utf-8") as fh:
+            fh.write(sc.entries_to_json([
+                {"label": "imported1", "group": "imp", "username": "iu",
+                 "password": "ip", "optional": "io"},
+                {"label": "github", "group": "work", "username": "alice",
+                 "password": "updated", "optional": ""}]))
+        sc.filedialog.askopenfilename = lambda **kw: ipath
+        sc.messagebox.askokcancel = lambda *a, **kw: True
+        sc.messagebox.showinfo = lambda *a, **kw: infos.append(a)
+        try:
+            app._import_json()
+            pump(app, 1.0)
+        finally:
+            sc.filedialog.askopenfilename = real_open
+            sc.messagebox.askokcancel = real_ok
+            sc.messagebox.showinfo = real_info
+    assert device.entries["imported1"]["password"] == "ip"
+    assert device.entries["github"]["password"] == "octocat!", \
+        "the stub's Replace outcome belongs to the device"
+    assert device.op_counts.get(sc.OP_PUT_ENTRY, 0) == puts_before + 2
+    assert device.op_counts.get(sc.OP_GET_LABELIDX, 0) == enum_before, \
+        "import enumerated the labels"
+    row = app.labels.get("imported1")
+    assert row and row["group"] == "imp" and row["username"] == "iu", row
+    assert app.labels.get("github")["group"] is None, \
+        "a pending Replace must unread the row"
+    assert infos and "Added or updated 1 of 2" in infos[0][1], infos
+    assert "Replace" in infos[0][1], infos
+    assert "Added or updated 1 of 2" in app.status.cget("text"), \
+        app.status.cget("text")
+    assert not app.busy
+    print("json import sends everything; a met label defers to the "
+          "device's Replace")
+
     # A detach clears every revealed field except label and group - back to
     # not-read, so the next look is confirmed again.
     gmail_row = app.labels.get("gmail")
@@ -519,6 +659,117 @@ def main():
     assert gmail_row["group"] == "personal"
     assert not app.labels.complete and not app.web_loaded
     print("detach wipes all but label+group")
+
+    # ---- offline backup: the open dialog, the viewer, the exports ----
+
+    # The full path a user takes: pick the archive, type the key (watch it
+    # group itself), Open - the decrypt thread posts back and the viewer
+    # appears. The fixture is the firmware-generated golden archive.
+    golden_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "golden_backup.bkp")
+    dlg = sc.OpenBackupDialog(app, app.mono, app._start_backup_decrypt)
+    app.backup_dialog = dlg
+    dlg.path_var.set(golden_path)
+    # Type the key keystroke by keystroke: the dashes appear as the groups
+    # fill, and - the regression - the cursor follows them, so no character
+    # lands before the one it was typed after. The regrouping is deferred to
+    # idle time (see _format_key), which the pump provides.
+    dlg.key_entry.focus_force()
+    pump(app, 0.1)
+    for ch in "c24c6d83e5bdbf999dda1fe0e90a5d02":
+        dlg.key_entry.event_generate("<Key>", keysym=ch)
+        app.update()
+    pump(app, 0.2)
+    assert dlg.key_var.get() == "C24C6D83-E5BDBF99-9DDA1FE0-E90A5D02", \
+        dlg.key_var.get()
+    assert dlg.key_entry.index("insert") == len(dlg.key_var.get())
+    dlg._open()
+    pump(app, 2.5)
+    assert not dlg.winfo_exists(), "successful open left the dialog"
+    viewer = next(w for w in app.winfo_children()
+                  if isinstance(w, sc.BackupViewer))
+    rows = [viewer.row_by_iid[i]["label"] for i in viewer.tree.get_children()]
+    assert rows == ["aws-root", "github", "gmail"], rows
+    values = viewer.tree.item(viewer.tree.get_children()[0], "values")
+    assert "s3cr3t-root" not in values, values   # no password in the table
+    print("open backup dialog decrypts into the viewer")
+
+    # A wrong key re-arms the dialog with the message; path and key stay.
+    dlg = sc.OpenBackupDialog(app, app.mono, app._start_backup_decrypt)
+    app.backup_dialog = dlg
+    dlg.path_var.set(golden_path)
+    dlg.key_var.set("0" * 32)
+    dlg._open()
+    pump(app, 2.5)
+    assert dlg.winfo_exists(), "failed open should keep the dialog"
+    assert str(dlg.open_btn.cget("state")) == "normal"
+    assert "does not match" in dlg.error.cget("text"), dlg.error.cget("text")
+    assert dlg.path_var.get() == golden_path
+    dlg.destroy()
+    app.backup_dialog = None
+    print("wrong backup key re-arms the dialog")
+
+    # Search narrows; the password bar fills on request for the selected row
+    # and empties the moment the selection moves.
+    viewer.search_var.set("gmail")
+    viewer._render()
+    assert len(viewer.tree.get_children()) == 1
+    viewer.search_var.set("")
+    viewer._render()
+
+    def viewer_select(label):
+        for iid in viewer.tree.get_children():
+            if viewer.row_by_iid[iid]["label"] == label:
+                viewer.tree.selection_set(iid)
+                return
+    viewer_select("gmail")
+    pump(app, 0.2)
+    viewer._toggle_password()
+    assert viewer.pw_var.get() == "hunter2", viewer.pw_var.get()
+    viewer_select("aws-root")
+    pump(app, 0.2)
+    assert viewer.pw_var.get() == "", "password bar outlived its row"
+    print("viewer search + show/hide password work")
+
+    # Show entry opens the same read-only viewer the live table uses, with
+    # every field of the backup entry - and no Edit button (nothing to edit).
+    viewer_select("gmail")
+    pump(app, 0.2)
+    viewer._show_entry()
+    pump(app, 0.2)
+    shown_viewer = next(w for w in viewer.winfo_children()
+                        if isinstance(w, sc.EntryViewer))
+    shown = {}
+    for child in shown_viewer.winfo_children():
+        if child.winfo_class() == "TEntry":
+            shown[child.grid_info()["row"]] = child.get()
+    assert list(shown.values()) == ["gmail", "persona", "alice@example.com",
+                                    "hunter2", "notes"], shown
+    shown_viewer.destroy()
+    print("viewer's show-entry holds all five fields")
+
+    # Exports land every entry, password included, in each format.
+    import tempfile as _tempfile
+    real_ask = sc.filedialog.asksaveasfilename
+    with _tempfile.TemporaryDirectory() as tmp:
+        for kind, check in (
+                ("json", lambda t: "s3cr3t-root" in t and t.startswith("[")),
+                ("csv", lambda t: "s3cr3t-root" in t and
+                    t.startswith(",".join(sc.EXPORT_FIELDS))),
+                ("yaml", lambda t: '"s3cr3t-root"' in t and
+                    t.startswith("- label:"))):
+            target = os.path.join(tmp, "out." + kind)
+            sc.filedialog.asksaveasfilename = lambda **kw: target
+            try:
+                viewer._export(kind)
+            finally:
+                sc.filedialog.asksaveasfilename = real_ask
+            with open(target, encoding="utf-8") as fh:
+                text = fh.read()
+            assert check(text), (kind, text[:100])
+            assert "passwords included" in viewer.status.cget("text")
+    viewer.destroy()
+    print("viewer exports json/csv/yaml with passwords")
 
     app._clear_clipboard()
     app.destroy()

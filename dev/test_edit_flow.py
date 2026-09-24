@@ -200,6 +200,17 @@ class EditFlowTests(unittest.TestCase):
                          [("put_wwwfill", ("SHOP.example.com", "buyer"))])
         self.assertEqual(ev.name, "saved")
 
+    # ---- a save racing a disconnect ----
+
+    def test_dead_session_answers_as_a_disconnect(self):
+        # A request queued just before the session dropped must come back
+        # as the disconnect it is, not as an AttributeError from the None
+        # session - the UI then re-arms the dialog with its values kept.
+        for name in ("edit_entry", "put_entry", "load_labels"):
+            worker = sc.Worker(queue.Queue())
+            with self.assertRaises(sc.Disconnected):
+                worker._dispatch(sc.Request(name))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -12,6 +12,7 @@ import os
 import sys
 import time
 import queue
+import tempfile
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -234,6 +235,107 @@ class MutationTests(unittest.TestCase):
             self.assertEqual(device.op_counts.get(sc.OP_PUT_WWWFILL, 0), 0)
         finally:
             transport.close()
+
+
+class BackupTests(unittest.TestCase):
+    """GET_BACKUP streams the encrypted archive; the export writes it in the
+    SECLAVE.BKP slot layout the device's restore flow reads back."""
+
+    def setUp(self):
+        self.device = stub_device.FakeDevice()
+        self.session, self.transport = connect(self.device)
+
+    def tearDown(self):
+        self.transport.close()
+
+    def test_stream_is_501_items_of_224_bytes(self):
+        items = list(self.session.stream_backup())
+        self.assertEqual(len(items), sc.BACKUP_ITEMS)
+        self.assertTrue(all(len(item) == sc.BACKUP_BLOB_SIZE
+                            for item in items))
+        self.assertEqual(items[0], self.device.backup_blob(0))
+        self.assertEqual(items[-1], self.device.backup_blob(sc.MAX_ENTRIES))
+        # The stream ends by reading past the header, never short of it.
+        self.assertEqual(self.device.op_counts[sc.OP_GET_BACKUP],
+                         sc.BACKUP_ITEMS + 1)
+
+    def test_arena_zeroed_after_stream(self):
+        list(self.session.stream_backup())
+        self.assertEqual(set(self.session.transport.arena.snapshot()), {0})
+
+    def test_archive_matches_the_mass_storage_layout(self):
+        items = list(self.session.stream_backup())
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "seclave.bkp")
+            size = sc.write_backup_archive(path, items)
+            with open(path, "rb") as fh:
+                data = fh.read()
+            leftovers = [n for n in os.listdir(tmp) if n != "seclave.bkp"]
+        self.assertEqual(leftovers, [])   # the temp file was renamed away
+        self.assertEqual(size, len(data))
+        # SECLAVE.BKP is 501 slots of 256 bytes = 128256; each slot is the
+        # 224-byte wire item and then zero padding.
+        self.assertEqual(len(data), sc.BACKUP_SLOT_SIZE * sc.BACKUP_ITEMS)
+        for i, item in enumerate(items):
+            slot = data[i * sc.BACKUP_SLOT_SIZE:(i + 1) * sc.BACKUP_SLOT_SIZE]
+            self.assertEqual(slot[:sc.BACKUP_BLOB_SIZE], item)
+            self.assertEqual(slot[sc.BACKUP_BLOB_SIZE:],
+                             b"\x00" * (sc.BACKUP_SLOT_SIZE
+                                        - sc.BACKUP_BLOB_SIZE))
+
+    def test_decline_raises_cancelled(self):
+        session, transport = connect(stub_device.FakeDevice(always_abort=True))
+        try:
+            with self.assertRaises(sc.Cancelled):
+                list(session.stream_backup())
+        finally:
+            transport.close()
+
+
+class BackupWorkerTests(unittest.TestCase):
+    """The export_backup request end to end: progress events while streaming,
+    the file on disk, and a disk failure reported without dropping the
+    session."""
+
+    def _drive(self, path):
+        session, transport = connect(stub_device.FakeDevice())
+        out = queue.Queue()
+        worker = sc.Worker(out)
+        worker.transport = transport
+        worker.session = session
+        worker.start()
+        try:
+            worker.submit("export_backup", path=path)
+            events = []
+            while True:
+                event = out.get(timeout=10)
+                events.append(event)
+                if event.name != "backup_progress":
+                    return events
+        finally:
+            worker.submit("quit")
+            worker.join(timeout=5)
+
+    def test_export_writes_the_file_and_reports_progress(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "seclave.bkp")
+            events = self._drive(path)
+            self.assertEqual(events[-1].name, "backup_saved")
+            self.assertEqual(events[-1].data["path"], path)
+            self.assertEqual(os.path.getsize(path), events[-1].data["size"])
+            self.assertEqual(os.path.getsize(path),
+                             sc.BACKUP_SLOT_SIZE * sc.BACKUP_ITEMS)
+        progress = [e for e in events if e.name == "backup_progress"]
+        self.assertEqual(len(progress), sc.BACKUP_ITEMS)
+        self.assertEqual(progress[-1].data,
+                         {"done": sc.BACKUP_ITEMS, "total": sc.BACKUP_ITEMS})
+
+    def test_unwritable_path_reports_error_not_disconnect(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "no_such_dir", "seclave.bkp")
+            events = self._drive(path)
+        self.assertEqual(events[-1].name, "error")
+        self.assertIn("Could not write the backup file", events[-1].data["message"])
 
 
 class AbortTests(unittest.TestCase):

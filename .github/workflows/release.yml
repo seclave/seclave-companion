@@ -26,6 +26,14 @@ jobs:
         run: python3 dev/test_protocol.py
       - name: Label table model tests
         run: python3 dev/test_label_rows.py
+      - name: Edit flow tests
+        run: python3 dev/test_edit_flow.py
+      - name: Marker conversion tests
+        run: python3 dev/test_marks.py
+      - name: Backup reader tests
+        run: python3 dev/test_backup.py
+      - name: JSON import tests
+        run: python3 dev/test_import.py
       - name: UI smoke test
         run: xvfb-run -a python3 dev/smoke_ui.py
 

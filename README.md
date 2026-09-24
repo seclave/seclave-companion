@@ -4,12 +4,17 @@ A desktop table view for a Seclave 2.0 hardware password manager, over the
 device's USB-slave (CDC-ACM serial) protocol. It lists the entries stored on the
 device in a searchable, sortable table and lets you copy a username or password,
 add an entry, edit one, or delete one - each secret action confirmed on the
-device's own screen.
+device's own screen. It can also save the device's encrypted backup archive to
+a file - and open such an archive offline with its backup key, view the
+entries, and export them to JSON, CSV or YAML.
 
 It is one self-contained Python file using only the standard library: no pip
-installs, no background service, and nothing written to disk. The real security
-boundary is the Seclave itself - its display and joystick, where you see and
-approve each action. This app is a convenience front-end.
+installs, no background service, and nothing written to disk except the files
+you explicitly ask for: an exported backup, which is ciphertext and useless
+without the backup key held apart from it, and the plaintext JSON, CSV or YAML
+export of an opened backup. The real security boundary is the Seclave itself -
+its display and joystick, where you see and approve each action. This app is a
+convenience front-end.
 
 ## Installation
 
@@ -113,6 +118,14 @@ so leaving it (or pressing UP) disconnects the app. Then:
    device. In the dialog, the **8 / 12 / 16 / 20** buttons beside the password
    field generate one of that length. A save that is declined or fails keeps
    everything you typed, so a rejected save cannot lose an entry.
+   The **→ Tab** and **↵ Enter** buttons beside the username, password and
+   optional fields put a tab or a newline in the field, which the device types
+   as a real Tab or Enter keypress - enough to step to the next box of a login
+   form, or to submit it. Both are invisible characters, so the field shows a
+   marker glyph in their place; the device stores the character itself. They
+   count as one character each against the field's limit. The label, group and
+   domain fields do not take them - the device holds those to a fixed
+   character set.
 5. **Search** filters as you type. Click a column header to sort by it, again
    to reverse, a third time to return to the device's own order.
 6. **Load single** fetches one entry by label, when you would rather not list
@@ -120,6 +133,38 @@ so leaving it (or pressing UP) disconnects the app. Then:
 7. The **View** dropdown switches to **Web passwords (wwwfill)**, confirmed
    once as "Show all wwwfills". Each view is fetched the first time you show
    it and is instant thereafter.
+8. **Export backup** saves the device's encrypted backup to a file (named
+   `seclave_YYYY_MM_DD.bkp` by default, so repeated backups collect side by
+   side) - the same archive the device offers as `SECLAVE.BKP` over
+   **Backup -> Export**, so the device's own **Backup -> Restore** reads it
+   back. One "Export backup" confirmation on the device covers the whole
+   stream. Restoring needs the backup key (**Backup -> Show key** on the
+   device); keep the file and the key in separate places - together they can
+   reconstruct every password.
+9. **Open backup** decrypts a backup file right here, with no device: choose
+   the archive, enter its 32-character backup key (shown grouped as
+   `XXXXXXXX-XXXXXXXX-XXXXXXXX-XXXXXXXX`), and the entries open in a
+   read-only table - label, group, username and optional in the clear, the
+   password shown only on request for the selected row, or in the full-entry
+   view. From there **Export JSON / CSV / YAML** writes every entry,
+   passwords included, to a plain file. Mind the warning the button shows
+   first: an opened backup bypasses the device's per-read confirmations -
+   every password in it is exposed to the computer, so do this only on a
+   machine you trust, and remember that the exported files are unprotected
+   plaintext.
+10. **Import JSON** adds entries in bulk from a file in the same format the
+    JSON export writes: a list of objects with `label`, `group`, `username`,
+    `password` and `optional` (label required, the rest default to empty).
+    The whole file is validated before anything is sent; then every entry is
+    sent, existing labels included, so an import can update stored entries -
+    a password rotation, for example. An entry whose label is already on the
+    device raises the device's Replace prompt: confirm there to take the
+    imported values, decline to keep the stored ones. Each entry is
+    confirmed on the device in the Normal and Ask all access modes - for a
+    large import, set **Admin -> Slave security** to **Allow all** first
+    (and back afterwards); in that mode there are no prompts and existing
+    labels are replaced outright. On firmware 2.6 and earlier the Replace
+    choice is not reported back, so those rows show as unread afterwards.
 
 Good to know:
 

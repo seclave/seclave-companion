@@ -158,6 +158,20 @@ class FakeDevice:
             return (bytes([status]) + sc.encode_field(sc.latin1(entry["username"]))
                     + sc.encode_field(sc.latin1(entry["password"])))
 
+        if opcode == sc.OP_GET_BACKUP:
+            # A decline never latches, so with --abort every call re-prompts
+            # and aborts, like the real device. Otherwise the first backup
+            # call carries the one "Export backup" confirmation and the rest
+            # of the stream is promptless.
+            if self.always_abort:
+                return bytes([sc.ST_ABORT])
+            if self.op_counts[opcode] == 1:
+                self._confirm_pause()
+            index, _ = sc.decode_int(body, 0)
+            if index >= sc.BACKUP_ITEMS:
+                return bytes([sc.ST_OUT_OF_INDEX])
+            return bytes([sc.ST_OK]) + sc.encode_field(self.backup_blob(index))
+
         if opcode == sc.OP_QUERY_STATUS:
             # No arguments, no prompt: version, used entries, capacity.
             used = len(self.entries) + len(self.web)
@@ -167,6 +181,8 @@ class FakeDevice:
                     + sc.encode_field(sc.latin1("500")))
 
         if opcode == sc.OP_PUT_ENTRY:
+            if self.always_abort:
+                return bytes([sc.ST_ABORT])
             self._confirm_pause()
             fields, _ = self._read_fields(body, 5)
             label, group, username, password, optional = fields
@@ -207,6 +223,13 @@ class FakeDevice:
             return bytes([sc.ST_ENTRY_NOT_FOUND])
 
         return bytes([sc.ST_PARSE_ERROR])
+
+    @staticmethod
+    def backup_blob(index):
+        """Deterministic 224-byte pseudo-ciphertext for one backup item, so a
+        test can check the written archive byte for byte."""
+        return bytes((index * 31 + i) % 256
+                     for i in range(sc.BACKUP_BLOB_SIZE))
 
     def _read_fields(self, body, count):
         values = []
