@@ -48,7 +48,7 @@ import threading
 # The only place a release version is written by hand. Everything else derives
 # from it: the PyPI metadata, the deb/rpm, the Windows version resource, the
 # installer, and the artifact names. See "Releasing" in README.md.
-VERSION = "1.3.0"
+VERSION = "1.3.1"
 
 # ---------------------------------------------------------------------------
 # Optional tracing (--debug). Port discovery and the serial open are the two
@@ -2276,8 +2276,15 @@ if HAVE_TK:
         style.configure("CTA.TButton", foreground=STYLE["white"],
                         background=STYLE["green"], font=bold)
         style.map("CTA.TButton", background=[("active", STYLE["blue_hover"])])
-        style.configure("Treeview", rowheight=24, fieldbackground=STYLE["bg"],
-                        background=STYLE["bg"], foreground=STYLE["body"])
+        # Row height is in pixels but the row font is in points, so a fixed
+        # height clips the text on a scaled desktop. Size it from the font;
+        # 24 is the floor, since Tk on macOS counts a point as a pixel and
+        # would otherwise shrink the rows.
+        linespace = tkfont.Font(root=root, font=base).metrics("linespace")
+        rowheight = max(24, int(round(linespace * 4 / 3)))
+        style.configure("Treeview", rowheight=rowheight,
+                        fieldbackground=STYLE["bg"], background=STYLE["bg"],
+                        foreground=STYLE["body"])
         style.configure("Treeview.Heading", font=bold,
                         background=STYLE["blue"], foreground=STYLE["white"])
         style.map("Treeview",
@@ -2292,6 +2299,30 @@ if HAVE_TK:
         # dialog and ignore it.
         root.option_add("*Dialog.msg.wrapLength", "6i")
         return style
+
+    def ask_path(ask, parent, **options):
+        """Run a filedialog ask function (askopenfilename, asksaveasfilename)
+        over `parent`, with the file list sized first; see fit_file_dialog."""
+        if parent.tk.call("tk", "windowingsystem") == "x11":
+            parent.after_idle(fit_file_dialog, parent)
+        return ask(parent=parent, **options)
+
+    def fit_file_dialog(parent):
+        """Tk's own file dialog, the one X11 gets (Windows and macOS use the
+        native one), lists files on a canvas fixed at 400x120 pixels: a few
+        rows, and fewer still once the desktop scales text up. Size the list
+        from its font. Queued by ask_path, this runs in the idle pass Tk makes
+        before it measures and centres the dialog, so the dialog opens at the
+        new size, centred. The dialog is kept and reused, so later opens find
+        it sized already."""
+        dialog = ("" if str(parent) == "." else str(parent)) + ".__tk_filedialog"
+        canvas = dialog + ".contents.icons.cHull.canvas"
+        if not int(parent.tk.call("winfo", "exists", canvas)):
+            return
+        line = tkfont.nametofont("TkIconFont", root=parent).metrics("linespace")
+        width = min(40 * line, parent.winfo_screenwidth() * 3 // 4)
+        height = min(18 * line, parent.winfo_screenheight() // 2)
+        parent.tk.call(canvas, "configure", "-width", width, "-height", height)
 
     def draw_key_mark(canvas):
         """The key mark as simple vectors: brushed ring, blue lens, shaft with
@@ -2575,8 +2606,9 @@ if HAVE_TK:
             self.grab_set()
 
         def _browse(self):
-            path = filedialog.askopenfilename(
-                parent=self, title="Open backup",
+            path = ask_path(
+                filedialog.askopenfilename, self,
+                title="Open backup",
                 filetypes=[("Seclave backup", "*.bkp *.BKP"),
                            ("All files", "*")])
             if path:
@@ -2766,8 +2798,9 @@ if HAVE_TK:
         def _export(self, kind):
             serializer = {"json": entries_to_json, "csv": entries_to_csv,
                           "yaml": entries_to_yaml}[kind]
-            path = filedialog.asksaveasfilename(
-                parent=self, title=f"Export {kind.upper()}",
+            path = ask_path(
+                filedialog.asksaveasfilename, self,
+                title=f"Export {kind.upper()}",
                 initialfile=f"{self.export_stem}.{kind}",
                 defaultextension="." + kind,
                 filetypes=[(kind.upper(), "*." + kind), ("All files", "*")])
@@ -3745,8 +3778,9 @@ if HAVE_TK:
             # file alone reveals nothing - and restores nothing.
             if not self._require_connection():
                 return
-            path = filedialog.asksaveasfilename(
-                parent=self, title="Export backup",
+            path = ask_path(
+                filedialog.asksaveasfilename, self,
+                title="Export backup",
                 initialfile=default_backup_filename(),
                 defaultextension=".bkp",
                 filetypes=[("Seclave backup", "*.bkp *.BKP"),
@@ -3763,8 +3797,9 @@ if HAVE_TK:
             # file is fixed and retried, never half-imported.
             if not self._require_connection():
                 return
-            path = filedialog.askopenfilename(
-                parent=self, title="Import JSON",
+            path = ask_path(
+                filedialog.askopenfilename, self,
+                title="Import JSON",
                 filetypes=[("JSON", "*.json"), ("All files", "*")])
             if not path:
                 return
